@@ -5,7 +5,8 @@ from typhon.arts.workspace import Workspace, arts_agenda
 from typhon.arts import xml
 from typhon.physics import wavelength2frequency, wavenumber2frequency
 from poem import oem
-
+from retrieval_plotting import plot_retrieval_profiles
+from arts_with_python.arts_data_handler import gridded_field_to_xr_ds
 
 ws = Workspace(verbosity = 1)
 indir = outdir = "a_priori/"
@@ -36,6 +37,8 @@ ws.Copy(ws.ppath_agenda, ws.ppath_agenda__FollowSensorLosPath)
 # no refraction
 ws.Copy(ws.ppath_step_agenda, ws.ppath_step_agenda__GeometricPath)
 
+ws.Copy(ws.abs_xsec_agenda, ws.abs_xsec_agenda__noCIA)
+
 ws.stokes_dim = 1
 ws.jacobian_quantities = []
 ws.iy_unit = "PlanckBT"
@@ -53,14 +56,13 @@ def read_abs_lines(ws, spectral_limit1, spectral_limit2, spectral_str):
     :return:
     """
     if spectral_str == "wavelength":
-        spectral_limit2 = wavelength2frequency(spectral_limit1 * 10e-6)
-        spectral_limit1 = wavelength2frequency(spectral_limit2 * 10e-6)
+        spectral_limit2 = wavelength2frequency(spectral_limit1 * 1e-6)
+        spectral_limit1 = wavelength2frequency(spectral_limit2 * 1e-6)
     elif spectral_str == "wavenumber":
         spectral_limit1 = wavenumber2frequency(spectral_limit1 * 100)
         spectral_limit2 = wavenumber2frequency(spectral_limit2 * 100)
 
     # define absorbing species and load lines for given frequency range from HITRAN
-    ws.Copy(ws.abs_xsec_agenda, ws.abs_xsec_agenda__noCIA)
     ws.abs_speciesSet(species=["H2O, H2O-SelfContCKDMT252, H2O-ForeignContCKDMT252",
                                "O2, O2-CIAfunCKDMT100",
                                "N2, N2-CIAfunCKDMT252, N2-CIArotCKDMT252",
@@ -72,7 +74,6 @@ def read_abs_lines(ws, spectral_limit1, spectral_limit2, spectral_str):
                                spectral_limit2)
     ws.abs_lines_per_speciesCreateFromLines()
     return ws
-
 
 ws = read_abs_lines(ws, 595, 1405, "wavenumber")
 # ws = read_abs_lines(ws, 595, 755, "wavenumber")
@@ -144,9 +145,9 @@ ws.jacobianOff()
 a_priori = np.copy(ws.vmr_field.value[0, :, 0, 0])
 a_priori_T = np.copy(ws.t_field.value[:, 0, 0])
 perturbed = 1.4 * a_priori
-perturbed_T = 0.8 * a_priori_T
+perturbed_T = 0.95 * a_priori_T
 perturbed[10] = perturbed[9] * 1.5
-perturbed_T[10] = perturbed_T[9] * 1.2
+perturbed_T[10] = perturbed_T[9] * 1.05
 ws.vmr_field.value[0, :, 0, 0] = perturbed
 ws.t_field.value[:, 0, 0] = perturbed_T
 
@@ -175,7 +176,7 @@ ws.retrievalAddTemperature(
                            g1=ws.p_grid,
                            g2=ws.lat_grid,
                            g3=ws.lon_grid)
-ws.covmat_sxAddBlock(block=xml.load("a_priori/covariance_H2O, H2O-SelfContCKDMT252, H2O-ForeignContCKDMT252.xml"))
+ws.covmat_sxAddBlock(block=xml.load("a_priori/covariance_T.xml"))
 # Setup observation error covariance matrix.
 ws.covmat_seAddBlock(block=1.0 ** 2 * np.diag(np.ones(ws.y.value.size)))
 ws.retrievalDefClose()
@@ -196,6 +197,8 @@ def inversion_agenda(ws):
 ws.Copy(ws.inversion_iterate_agenda, inversion_agenda)
 
 ws.xaStandard() # if supplying user-defined a priori vector
+ws.xa.value[:len(perturbed)] = ws.vmr_field.value[0,:,0,0]
+ws.xa.value[len(perturbed):] = ws.t_field.value[:,0,0]
 ws.x  = np.array([]) # create empty vector for retrieved state vector?
 ws.yf = np.array([]) # create empty vector for simulated TB?
 ws.jacobian = np.array([[]])
@@ -217,13 +220,8 @@ ws.x2artsAtmAndSurf() # convert from ARTS coords back to user-defined grid
 ###########################################################################
 # HUMIDITY
 retrieved = np.copy(ws.vmr_field)[0,:,0,0]
-plt.figure()
-plt.plot(perturbed, alt, label = "Truth", c = "blue")
-plt.plot(retrieved, alt, label = "Retrieved", c = "red")
-plt.plot(a_priori, alt, label="A Priori", c = "grey", ls = "--")
-plt.xlabel("$H_2O [kg / m^3$]")
-plt.ylabel("z [km]")
-plt.legend()
+
+plot_retrieval_profiles(a_priori, retrieved, perturbed, alt, "H2O VMR")
 plt.savefig("plots/moist_layer_retrieval_profile.pdf")
 
 plt.figure()
@@ -233,13 +231,7 @@ plt.savefig("plots/covmat_H2O.pdf")
 
 # TEMPERATURE
 retrieved_T = np.copy(ws.t_field)[:,0,0]
-plt.figure()
-plt.plot(perturbed_T, alt, label = "Truth", c = "blue")
-plt.plot(retrieved_T, alt, label = "Retrieved", c = "red")
-plt.plot(a_priori_T, alt, label="A Priori", c = "grey", ls = "--")
-plt.xlabel("$Temperature [K]")
-plt.ylabel("z [km]")
-plt.legend()
+plot_retrieval_profiles(a_priori_T, retrieved_T, perturbed_T, alt, "Temperature")
 plt.savefig("plots/temp_retrieval_profile.pdf")
 
 plt.figure()
