@@ -45,7 +45,7 @@ ws.iy_unit = "PlanckBT"
 ws.cloudboxOff()
 
 
-def read_abs_lines(ws, spectral_limit1, spectral_limit2, spectral_str):
+def read_iasi_abs_lines(ws, spectral_limit1, spectral_limit2, spectral_str):
     """
     Read absorption lines from HITRAN catalogue into workspace for given spectral range, which can be
     in units of frequency, wavelength or wavenumber.
@@ -75,7 +75,7 @@ def read_abs_lines(ws, spectral_limit1, spectral_limit2, spectral_str):
     ws.abs_lines_per_speciesCreateFromLines()
     return ws
 
-ws = read_abs_lines(ws, 595, 1405, "wavenumber")
+ws = read_iasi_abs_lines(ws, 595, 1405, "wavenumber")
 # ws = read_abs_lines(ws, 595, 755, "wavenumber")
 
 ###########################################################################
@@ -83,9 +83,12 @@ ws = read_abs_lines(ws, 595, 1405, "wavenumber")
 ###########################################################################
 
 ws.atmosphere_dim = 1  # for 1DVAR
-p = np.array(
-    [1000., 975., 950., 925., 900., 850., 800., 750., 700., 650., 600., 550., 500., 400., 300., 200., 100.])*100.0
-ws.p_grid = 0.5 * (p[1:] + p[:-1])
+#p = np.array(
+#    [1000., 975., 950., 925., 900., 850., 800., 750., 700., 650., 600., 550., 500., 400., 300., 200., 100.])*100.0
+garand = gridded_field_to_xr_ds(
+    xml.load("/scratch/uni/u237/users/mprange/arts/controlfiles/testdata/garand_profiles.xml.gz")[0], "z")
+p = garand["z"].values
+ws.p_grid = p
 ws.AtmRawRead(basename="testdata/tropical") #tropical atmosphere assumed
 ws.lat_grid = []
 ws.lon_grid = []
@@ -112,9 +115,9 @@ co2_band = np.arange(wavenumber2frequency(595*100), wavenumber2frequency(755*100
 # Grid spacing and FWHM of the Gaussian response should match!
 ws.f_grid.value = np.concatenate((co2_band, h2o_band))
 # load external f_backend
-ws.ReadXML( ws.f_backend, "sensor_specs/IASI/f_backend.xml" )
+ws.ReadXML(ws.f_backend, "sensor_specs/IASI/f_backend.xml" )
 ws.VectorCreate("f_backend_width")
-ws.ReadXML( ws.f_backend_width, "sensor_specs/IASI/f_backend_width.xml" )
+ws.ReadXML(ws.f_backend_width, "sensor_specs/IASI/f_backend_width.xml" )
 ws.backend_channel_responseGaussian(ws.f_backend_width)
 
 # Sensor settings
@@ -140,25 +143,16 @@ ws.sensor_checkedCalc()
 ws.jacobianOff()
 
 ###########################################################################
-# Initial call of Forward Model
+# Load "observations" and save a priori state
 ###########################################################################
-a_priori = np.copy(ws.vmr_field.value[0, :, 0, 0])
-a_priori_T = np.copy(ws.t_field.value[:, 0, 0])
-perturbed = 1.4 * a_priori
-perturbed_T = 0.95 * a_priori_T
-perturbed[10] = perturbed[9] * 1.5
-perturbed_T[10] = perturbed_T[9] * 1.05
-ws.vmr_field.value[0, :, 0, 0] = perturbed
-ws.t_field.value[:, 0, 0] = perturbed_T
-
-ws.yCalc()
-ws.y.value # write out TBs for first ycalc
-
+ws.y = xml.load("/scratch/uni/u237/users/mprange/phd/iasi_retrieval/iasi_obs_simulation/iasi_obs.xml")[0]
+a_priori_vmr = ws.vmr_field.value
+a_priori_T = ws.t_field.value
+xml.save(a_priori_vmr, "a_priori/vmr_apriori.xml")
+xml.save(a_priori_T, "a_priori/T_apriori.xml")
 ###########################################################################
 # Prepare OEM retrieval
 ###########################################################################
-ws.vmr_field.value[0, :, 0, 0] = a_priori
-ws.t_field.value[:, 0, 0] = a_priori_T
 ws.retrievalDefInit()
 
 retrieval_species = ["H2O, H2O-SelfContCKDMT252, H2O-ForeignContCKDMT252",
@@ -178,6 +172,8 @@ ws.retrievalAddTemperature(
                            g3=ws.lon_grid)
 ws.covmat_sxAddBlock(block=xml.load("a_priori/covariance_T.xml"))
 # Setup observation error covariance matrix.
+
+Se_covmat = oem.iasi_nedt()
 ws.covmat_seAddBlock(block=1.0 ** 2 * np.diag(np.ones(ws.y.value.size)))
 ws.retrievalDefClose()
 
@@ -196,9 +192,7 @@ def inversion_agenda(ws):
 
 ws.Copy(ws.inversion_iterate_agenda, inversion_agenda)
 
-ws.xaStandard() # if supplying user-defined a priori vector
-ws.xa.value[:len(perturbed)] = ws.vmr_field.value[0,:,0,0]
-ws.xa.value[len(perturbed):] = ws.t_field.value[:,0,0]
+ws.xaStandard() # a_priori vector is current state of retrieval fields in ws.
 ws.x  = np.array([]) # create empty vector for retrieved state vector?
 ws.yf = np.array([]) # create empty vector for simulated TB?
 ws.jacobian = np.array([[]])
@@ -214,14 +208,19 @@ ws.OEM(method="gn",
 print(ws.oem_errors.value)
 ws.x2artsAtmAndSurf() # convert from ARTS coords back to user-defined grid
 
+###########################################################################
+# Save retrieval results
+###########################################################################
+retrieved_vmr = np.copy(ws.vmr_field.value)
+retrieved_T = np.copy(ws.t_field.value)
+xml.save(retrieved_vmr, "retrieved/vmr_retrieved.xml")
+xml.save(retrieved_T, "retrieved/T_retrieved.xml")
 
 ###########################################################################
-# Plot results
+# Plot retrieval results
 ###########################################################################
 # HUMIDITY
-retrieved = np.copy(ws.vmr_field)[0,:,0,0]
-
-plot_retrieval_profiles(a_priori, retrieved, perturbed, alt, "H2O VMR")
+plot_retrieval_profiles(a_priori, retrieved, garand["abs_species-H2O"].values, alt, "H2O VMR")
 plt.savefig("plots/moist_layer_retrieval_profile.pdf")
 
 plt.figure()
@@ -231,7 +230,7 @@ plt.savefig("plots/covmat_H2O.pdf")
 
 # TEMPERATURE
 retrieved_T = np.copy(ws.t_field)[:,0,0]
-plot_retrieval_profiles(a_priori_T, retrieved_T, perturbed_T, alt, "Temperature")
+plot_retrieval_profiles(a_priori_T, retrieved_T, garand["T"].values, alt, "Temperature")
 plt.savefig("plots/temp_retrieval_profile.pdf")
 
 plt.figure()
