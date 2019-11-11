@@ -5,7 +5,19 @@ from typhon.arts.workspace import arts_agenda
 from typhon.physics import wavenumber2frequency, frequency2wavenumber
 
 
-def load_abs_lookup(ws, atm_batch_path=None, f_ranges=None, abs_lookup_table_path=None):
+def setup_retrieval_paths(project_path, project_name):
+    """
+    Setup the directory infrastructure for the retrieval project I am working on.
+    """
+    if not os.path.isdir(project_path + project_name):
+        os.mkdir(project_path + project_name)
+    for dir_name in ["plots", "sensor", "a_priori", "observations", "retrieval_output"]:
+        if not os.path.isdir(project_path + project_name + f"/{dir_name}"):
+            os.mkdir(project_path + project_name + f"/{dir_name}")
+    os.chdir(project_path + project_name)
+
+
+def load_abs_lookup(ws, atm_batch_path=None, f_ranges=None, line_shape='Voigt_Kuntz6'):
     """
     Loads existing absorption lookup table or creates one in case it does
     not exist yet for given batch of atmospheres and frequency range.
@@ -15,15 +27,19 @@ def load_abs_lookup(ws, atm_batch_path=None, f_ranges=None, abs_lookup_table_pat
     :param abs_lookup_table_path:
     :return:
     """
-    if abs_lookup_table_path is not None:
-        ws.ReadXML(ws.abs_lookup, abs_lookup_table_path)
+    f_str = "_".join([f"{int(frequency2wavenumber(freq[0] / 100))}_"
+                      f"{int(frequency2wavenumber(freq[1]) / 100)}" for freq in f_ranges])
+    abs_lookup_path = "/scratch/uni/u237/users/mprange/phd/iasi_retrieval/abs_lookup_tables/" \
+                      f"abs_lookup_{os.path.basename(atm_batch_path).split(os.extsep, 1)[0]}_{f_str}_cm-1.xml"
+    if os.path.isfile(abs_lookup_path):
+        ws.ReadXML(ws.abs_lookup, abs_lookup_path)
         ws = abs_setup(ws)
         ws.abs_lookupAdapt()
     else:
         ws.ReadXML(ws.batch_atm_fields_compact,
                    atm_batch_path)
         ws = abs_setup(ws)
-        ws.abs_lineshapeDefine(shape='Voigt_Kuntz6',
+        ws.abs_lineshapeDefine(shape=line_shape,
                                forefactor='VVH',
                                cutoff=750e9)
         ws.abs_linesReadFromSplitArtscat(
@@ -34,11 +50,7 @@ def load_abs_lookup(ws, atm_batch_path=None, f_ranges=None, abs_lookup_table_pat
         ws.abs_lookupSetupBatch()
         ws.abs_xsec_agenda_checkedCalc()
         ws.abs_lookupCalc()
-        f_str = "_".join([f"{int(frequency2wavenumber(freq[0]/100))}_"
-                          f"{int(frequency2wavenumber(freq[1])/100)}" for freq in f_ranges])
-        ws.WriteXML("binary", ws.abs_lookup,
-                    f"a_priori/abs_lookup_{os.path.splitext(os.path.basename(atm_batch_path))[0]}"
-                    f"_{f_str}_cm-1.xml")
+        ws.WriteXML("binary", ws.abs_lookup, abs_lookup_path)
     return ws
 
 
@@ -67,6 +79,7 @@ def setup_sensor(ws, f_ranges, f_backend_width):
     ws.AntennaOff()
     ws.sensor_responseInit()
     ws.sensor_responseBackend()
+    ws.WriteXML("binary", ws.f_backend, "sensor/f_backend.xml")
     return ws
 
 
@@ -120,6 +133,9 @@ def iasi_observation(ws, atm_batch_path, n_atmospheres, f_ranges, iasi_obs_path=
     :param iasi_obs_path:
     :return:
     """
+    f_str = "_".join([f"{int(frequency2wavenumber(freq[0] / 100))}_"
+                      f"{int(frequency2wavenumber(freq[1]) / 100)}" for freq in f_ranges])
+    batch_atm_fields_name = os.path.basename(atm_batch_path).split(os.extsep, 1)[0]
     if iasi_obs_path:
         ws.ReadXML(ws.ybatch, iasi_obs_path)
     else:
@@ -155,16 +171,12 @@ def iasi_observation(ws, atm_batch_path, n_atmospheres, f_ranges, iasi_obs_path=
                 np.random.normal(loc=0.0, scale=0.1)
             ws.ybatch.value[i][ws.f_backend.value >= wavenumber2frequency(175000)] += \
                 np.random.normal(loc=0.0, scale=0.2)
-        f_str = "_".join([f"{int(frequency2wavenumber(freq[0]/100))}_"
-                          f"{int(frequency2wavenumber(freq[1])/100)}" for freq in f_ranges])
-        if not os.path.isdir(f"iasi_obs_{os.path.splitext(os.path.basename(atm_batch_path))[0]}"):
-            os.mkdir(f"iasi_obs_{os.path.splitext(os.path.basename(atm_batch_path))[0]}/")
-        ws.WriteXML("ascii", ws.ybatch.value,
-                    f"iasi_obs_{os.path.splitext(os.path.basename(atm_batch_path))[0]}/"
-                    f"{os.path.splitext(os.path.basename(atm_batch_path))[0]}_{f_str}_cm-1.xml")
-        ws.WriteXML("ascii", ws.ybatch_jacobians.value,
-                    f"iasi_obs_{os.path.splitext(os.path.basename(atm_batch_path))[0]}/"
-                    f"{os.path.splitext(os.path.basename(atm_batch_path))[0]}_{f_str}_cm-1_jacobian.xml")
+        ws.WriteXML("ascii", ws.ybatch_jacobians,
+                    f"observations/{batch_atm_fields_name}_{f_str}_cm-1_jacobian.xml")
+        ws.WriteXML("ascii", ws.batch_atm_fields_compact,
+                    f"observations/{batch_atm_fields_name}_{f_str}_cm-1_jacobian.xml")
+    ws.WriteXML("ascii", ws.ybatch,
+                f"observations/{batch_atm_fields_name}_{f_str}_cm-1.xml")
     return ws
 
 
@@ -223,7 +235,6 @@ def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, cov_h2o
     ws.cloudbox_checkedCalc()
     ws.sensor_checkedCalc()
     ws.propmat_clearsky_agenda_checkedCalc()
-
     ws.retrievalDefInit()
     if "Temperature" in retrieval_quantities:
         ws.retrievalAddTemperature(
@@ -246,7 +257,12 @@ def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, cov_h2o
     cov_y[high_noise_ind, high_noise_ind] *= 0.2 ** 2
     ws.covmat_seAddBlock(block=cov_y)
     ws.retrievalDefClose()
+    ws.WriteXML("ascii", ws.vmr_field, "a_priori/a_priori_vmr.xml")
+    ws.WriteXML("ascii", ws.t_field, "a_priori/a_priori_temperature.xml")
+    ws.WriteXML("ascii", ws.p_grid, "a_priori/a_priori_p.xml")
+    ws.WriteXML("ascii", ws.z_field, "a_priori/a_priori_z.xml")
     return ws
+
 
 def oem_retrieval(ws, ybatch_indices, inversion_method="lm", max_iter=20, gamma_start=1000,
                   gamma_dec_factor=2.0, gamma_inc_factor=2.0, gamma_upper_limit=1e20,
@@ -284,6 +300,8 @@ def oem_retrieval(ws, ybatch_indices, inversion_method="lm", max_iter=20, gamma_
 
     retrieved_h2o_vmr = []
     retrieved_t = []
+    retrieved_y = []
+    retrieved_jacobian = []
     vmr_a_priori = np.copy(ws.vmr_field.value)
     t_a_priori = np.copy(ws.t_field.value)
     for obs in np.array(ws.ybatch.value)[ybatch_indices]:
@@ -308,4 +326,13 @@ def oem_retrieval(ws, ybatch_indices, inversion_method="lm", max_iter=20, gamma_
         ws.x2artsAtmAndSurf()  # convert from ARTS coords back to user-defined grid
         retrieved_h2o_vmr.append(ws.vmr_field.value[0, :, 0, 0])
         retrieved_t.append(ws.t_field.value[:, 0, 0])
-    return retrieved_h2o_vmr, retrieved_t
+        retrieved_y.append(ws.y.value)
+        retrieved_jacobian.append(ws.jacobian.value)
+        ws.WriteXML("ascii", retrieved_h2o_vmr, "retrieval_output/retrieved_h2o_vmr.xml")
+        ws.WriteXML("ascii", retrieved_t, "retrieval_output/retrieved_temperature.xml")
+        ws.WriteXML("ascii", retrieved_y, "retrieval_output/retrieved_y.xml")
+        ws.WriteXML("ascii", retrieved_jacobian, "retrieval_output/retrieved_jacobian.xml")
+
+    return ws
+
+#def plot_retrieval_results():
