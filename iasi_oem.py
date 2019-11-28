@@ -2,8 +2,7 @@ import numpy as np
 import os
 
 from typhon.arts.workspace import arts_agenda
-from typhon.physics import wavenumber2frequency, frequency2wavenumber
-
+from typhon.physics import wavenumber2frequency, frequency2wavenumber, constants
 
 def setup_retrieval_paths(project_path, project_name):
     """
@@ -17,7 +16,7 @@ def setup_retrieval_paths(project_path, project_name):
     os.chdir(project_path + project_name)
 
 
-def load_abs_lookup(ws, atm_batch_path=None, f_ranges=None, line_shape='Voigt_Kuntz6'):
+def load_abs_lookup(ws, atm_batch_path=None, abs_lookup_path=None, f_ranges=None, line_shape='Voigt_Kuntz6'):
     """
     Loads existing absorption lookup table or creates one in case it does
     not exist yet for given batch of atmospheres and frequency range.
@@ -29,8 +28,10 @@ def load_abs_lookup(ws, atm_batch_path=None, f_ranges=None, line_shape='Voigt_Ku
     """
     f_str = "_".join([f"{int(frequency2wavenumber(freq[0] / 100))}_"
                       f"{int(frequency2wavenumber(freq[1]) / 100)}" for freq in f_ranges])
-    abs_lookup_path = "/scratch/uni/u237/users/mprange/phd/iasi_retrieval/abs_lookup_tables/" \
-                      f"abs_lookup_{os.path.basename(atm_batch_path).split(os.extsep, 1)[0]}_{f_str}_cm-1.xml"
+    if not abs_lookup_path:
+        abs_lookup_path = "/scratch/uni/u237/users/mprange/phd/iasi_retrieval/abs_lookup_tables/" \
+                          f"abs_lookup_{os.path.basename(atm_batch_path).split(os.extsep, 1)[0]}_{f_str}_cm-1_" \
+                          f"sfc_channels.xml"
     if os.path.isfile(abs_lookup_path):
         ws.ReadXML(ws.abs_lookup, abs_lookup_path)
         ws = abs_setup(ws)
@@ -71,6 +72,10 @@ def setup_sensor(ws, f_ranges, f_backend_width):
     ws.f_backend = np.concatenate([np.arange(freq[0],
                                              freq[1],
                                              f_backend_width) for freq in f_ranges])
+    full_spec = np.arange(wavenumber2frequency(645.0 * 100),
+                          wavenumber2frequency(2760.0 * 100),
+                          f_backend_width)
+    ws.f_backend = np.sort(np.append(ws.f_backend.value, full_spec[np.array([1026, 1190, 1193, 1270, 1883])]))
     ws.f_backend_width = np.array([f_backend_width])
     ws.backend_channel_responseGaussian(ws.f_backend_width)
 
@@ -83,7 +88,7 @@ def setup_sensor(ws, f_ranges, f_backend_width):
     return ws
 
 
-def load_generic_settings(ws):
+def load_generic_settings(ws, py_surface_agenda=False):
     """
     Load generic agendas and set generic settings.
     :param ws:
@@ -100,8 +105,21 @@ def load_generic_settings(ws):
     # cosmic background radiation
     ws.Copy(ws.iy_space_agenda, ws.iy_space_agenda__CosmicBackground)
 
-    # standard surface agenda (i.e., make use of surface_rtprop_agenda)
-    ws.Copy(ws.iy_surface_agenda, ws.iy_surface_agenda__UseSurfaceRtprop)
+    if py_surface_agenda:
+        @arts_agenda
+        def iy_surface_agendaPY(ws):
+            ws.SurfaceBlackbody()
+            ws.iySurfaceRtpropCalc()
+        ws.Copy(ws.iy_surface_agenda, iy_surface_agendaPY)
+    else:
+        # standard surface agenda (i.e., make use of surface_rtprop_agenda)
+        ws.Copy(ws.iy_surface_agenda, ws.iy_surface_agenda__UseSurfaceRtprop)
+
+    #if py_surface_agenda:
+        # snames = ["Water skin temperature", "Wind speed", "Salinity", "Wind direction"]
+        # sdata = np.array([ws.t_field.value[0, 0, 0], 3.4, 0.035, 0]).reshape(4, 1, 1)
+        # ws.Copy(ws.surface_props_names, snames)
+        # ws.Copy(ws.surface_props_data, sdata)
 
     ws.Copy(ws.surface_rtprop_agenda, ws.surface_rtprop_agenda__Specular_NoPol_ReflFix_SurfTFromt_surface)
 
@@ -119,7 +137,7 @@ def load_generic_settings(ws):
     ws.jacobian_quantities = []
     ws.iy_unit = "PlanckBT"
     ws.cloudboxOff()
-    ws.surface_scalar_reflectivity = np.array([0.05])  # nominal albedo for surface
+    ws.surface_scalar_reflectivity = np.array([0.01])  # nominal albedo for surface
     return ws
 
 
@@ -136,6 +154,7 @@ def iasi_observation(ws, atm_batch_path, n_atmospheres, f_ranges, iasi_obs_path=
     f_str = "_".join([f"{int(frequency2wavenumber(freq[0] / 100))}_"
                       f"{int(frequency2wavenumber(freq[1]) / 100)}" for freq in f_ranges])
     batch_atm_fields_name = os.path.basename(atm_batch_path).split(os.extsep, 1)[0]
+
     if iasi_obs_path:
         ws.ReadXML(ws.ybatch, iasi_obs_path)
     else:
@@ -147,20 +166,25 @@ def iasi_observation(ws, atm_batch_path, n_atmospheres, f_ranges, iasi_obs_path=
             ws.Extract(ws.atm_fields_compact,
                        ws.batch_atm_fields_compact,
                        ws.ybatch_index)
-            ws.AtmFieldsFromCompact()
+            ws.AtmFieldsAndParticleBulkPropFieldFromCompact()
+
             # ws.jacobianOff()
             ws.jacobianInit()
-            ws.jacobianAddAbsSpecies(species="H2O, H2O-SelfContCKDMT252, H2O-ForeignContCKDMT252",
-                                     g1=ws.p_grid, g2=ws.lat_grid, g3=ws.lon_grid)
             ws.jacobianAddTemperature(g1=ws.p_grid, g2=ws.lat_grid, g3=ws.lon_grid)
+            ws.jacobianAddAbsSpecies(species="H2O, H2O-SelfContCKDMT252, H2O-ForeignContCKDMT252",
+                                     unit="rel",
+                                     g1=ws.p_grid, g2=ws.lat_grid, g3=ws.lon_grid)
             ws.jacobianClose()
             ws.Extract(ws.z_surface, ws.z_field, 0)
             ws.Extract(ws.t_surface, ws.t_field, 0)
+
+            #ws.MatrixSetConstant(ws.t_surface, 1, 1, 300.)
             ws.atmfields_checkedCalc(bad_partition_functions_ok=1)
             ws.atmgeom_checkedCalc()
             ws.cloudbox_checkedCalc()
             ws.sensor_checkedCalc()
             ws.yCalc()
+            #ws.jacobianAdjustAndTransform()
 
         ws.Copy(ws.ybatch_calc_agenda, ybatch_calc_agenda)
         ws.IndexSet(ws.ybatch_n, n_atmospheres)  # Amount of atmospheres
@@ -168,13 +192,15 @@ def iasi_observation(ws, atm_batch_path, n_atmospheres, f_ranges, iasi_obs_path=
         # Add measurement noise to synthetic observation
         for i in range(n_atmospheres):
             ws.ybatch.value[i][ws.f_backend.value < wavenumber2frequency(175000)] += \
-                np.random.normal(loc=0.0, scale=0.1)
+                np.array([np.random.normal(loc=0.0, scale=0.1)
+                          for i in range(np.sum(ws.f_backend.value < wavenumber2frequency(175000)))])
             ws.ybatch.value[i][ws.f_backend.value >= wavenumber2frequency(175000)] += \
-                np.random.normal(loc=0.0, scale=0.2)
+                np.array([np.random.normal(loc=0.0, scale=0.2)
+                          for i in range(np.sum(ws.f_backend.value >= wavenumber2frequency(175000)))])
         ws.WriteXML("ascii", ws.ybatch_jacobians,
                     f"observations/{batch_atm_fields_name}_{f_str}_cm-1_jacobian.xml")
         ws.WriteXML("ascii", ws.batch_atm_fields_compact,
-                    f"observations/{batch_atm_fields_name}_{f_str}_cm-1_jacobian.xml")
+                    f"observations/{batch_atm_fields_name}_atm_fields.xml")
     ws.WriteXML("ascii", ws.ybatch,
                 f"observations/{batch_atm_fields_name}_{f_str}_cm-1.xml")
     return ws
@@ -187,21 +213,21 @@ def abs_setup(ws):
     :param ws:
     :return:
     """
-    ws.batch_atm_fields_compactAddConstant(name="abs_species-O2",
-                                           value=0.2095,
-                                           condensibles=["abs_species-H2O"])
-    ws.batch_atm_fields_compactAddConstant(name="abs_species-N2",
-                                           value=0.7808,
-                                           condensibles=["abs_species-H2O"])
-    ws.batch_atm_fields_compactAddConstant(name="abs_species-CO2",
-                                           value=0.0004,
-                                           condensibles=["abs_species-H2O"])
     # define absorbing species and load lines for given frequency range from HITRAN
     ws.abs_speciesSet(species=["H2O, H2O-SelfContCKDMT252, H2O-ForeignContCKDMT252",
                                "O2, O2-CIAfunCKDMT100",
                                "N2, N2-CIAfunCKDMT252, N2-CIArotCKDMT252",
                                "O3",
                                "CO2, CO2-CKDMT252"])
+    ws.batch_atm_fields_compactAddConstant(name="abs_species-O2",
+                                           value=0.2095,
+                                           condensibles=["abs_species-H2O"])
+    ws.batch_atm_fields_compactAddConstant(name="abs_species-N2",
+                                           value=0.7808,
+                                           condensibles=["abs_species-H2O"])
+    #ws.batch_atm_fields_compactAddConstant(name="abs_species-CO2",
+    #                                       value=0.0004,
+    #                                       condensibles=["abs_species-H2O"])
     return ws
 
 
@@ -221,15 +247,15 @@ def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, cov_h2o
     ws.Extract(ws.atm_fields_compact,
                ws.batch_atm_fields_compact,
                a_priori_atm_index)
-    ws.AtmFieldsFromCompact()
+    ws.AtmFieldsAndParticleBulkPropFieldFromCompact()
     ws.lat_grid = []
     ws.lon_grid = []
     ws.p_grid = ws.atm_fields_compact.value.grids[1]
     # ws.AtmFieldsCalc()
     ws.AbsInputFromAtmFields()
-    ws.z_surface = np.asarray(ws.z_field)[0]
-    ws.t_surface = np.asarray(ws.t_field)[0]
-
+    ws.Extract(ws.z_surface, ws.z_field, 0)
+    ws.Extract(ws.t_surface, ws.t_field, 0)
+    #ws.MatrixSetConstant(ws.t_surface, 1, 1, 300.)
     ws.atmfields_checkedCalc(bad_partition_functions_ok=1)
     ws.atmgeom_checkedCalc()
     ws.cloudbox_checkedCalc()
@@ -250,17 +276,24 @@ def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, cov_h2o
                                   g3=ws.lon_grid)
         ws.jacobianSetFuncTransformation(transformation_func="log10")
         ws.covmat_sxAddBlock(block=cov_h2o_vmr)
+    #ws.Append(ws.surface_props_data, ws.t_surface)
+    #ws.Append(ws.surface_props_names, "t_surface")
+    #ws.retrievalAddSurfaceQuantity(quantity="t_surface",
+    #                               g1=ws.lat_grid,
+    #                               g2=ws.lon_grid)
+    #ws.covmat_sxAddBlock(block=np.array([[100]]))
     cov_y = np.diag(np.ones(ws.f_backend.value.size))
     low_noise_ind = ws.f_backend.value < wavenumber2frequency(175000)
     high_noise_ind = ws.f_backend.value >= wavenumber2frequency(175000)
-    cov_y[low_noise_ind, low_noise_ind] *= 0.1 ** 2
-    cov_y[high_noise_ind, high_noise_ind] *= 0.2 ** 2
+    cov_y[low_noise_ind, low_noise_ind] *= 0.1
+    cov_y[high_noise_ind, high_noise_ind] *= 0.2
     ws.covmat_seAddBlock(block=cov_y)
     ws.retrievalDefClose()
     ws.WriteXML("ascii", ws.vmr_field, "a_priori/a_priori_vmr.xml")
     ws.WriteXML("ascii", ws.t_field, "a_priori/a_priori_temperature.xml")
     ws.WriteXML("ascii", ws.p_grid, "a_priori/a_priori_p.xml")
-    ws.WriteXML("ascii", ws.z_field, "a_priori/a_priori_z.xml")
+    ws.WriteXML("ascii", ws.z_field.value[:,0,0], "a_priori/a_priori_z.xml")
+    ws.WriteXML("ascii", cov_y, "sensor/covariance_y.xml")
     return ws
 
 
@@ -286,6 +319,10 @@ def oem_retrieval(ws, ybatch_indices, inversion_method="lm", max_iter=20, gamma_
     def inversion_agenda(ws):
         ws.Ignore(ws.inversion_iteration_counter)
         ws.x2artsAtmAndSurf()
+        #ws.Extract(ws.t_surface, ws.t_field, 0)
+        ws.t_surface = np.asarray(ws.t_field)[0]
+        print("atm0:" + str(ws.t_field.value[0,0,0]))
+        print("t_surface:" + str(ws.t_surface.value[0,0]))
         # to be safe, rerun checks dealing with atmosph.
         # Allow negative vmr? Allow temperatures < 150 K and > 300 K?
         ws.atmfields_checkedCalc(
@@ -324,15 +361,25 @@ def oem_retrieval(ws, ybatch_indices, inversion_method="lm", max_iter=20, gamma_
                                         gamma_lower_limit, gamma_upper_convergence_limit]))
         print(ws.oem_errors.value)
         ws.x2artsAtmAndSurf()  # convert from ARTS coords back to user-defined grid
-        retrieved_h2o_vmr.append(ws.vmr_field.value[0, :, 0, 0])
-        retrieved_t.append(ws.t_field.value[:, 0, 0])
-        retrieved_y.append(ws.y.value)
-        retrieved_jacobian.append(ws.jacobian.value)
-        ws.WriteXML("ascii", retrieved_h2o_vmr, "retrieval_output/retrieved_h2o_vmr.xml")
-        ws.WriteXML("ascii", retrieved_t, "retrieval_output/retrieved_temperature.xml")
-        ws.WriteXML("ascii", retrieved_y, "retrieval_output/retrieved_y.xml")
-        ws.WriteXML("ascii", retrieved_jacobian, "retrieval_output/retrieved_jacobian.xml")
+        #print(ws.t_surface.value)
+        #print(ws.t_field.value[0,0,0])
+        retrieved_h2o_vmr.append(np.copy(ws.vmr_field.value[0, :, 0, 0]))
+        retrieved_t.append(np.copy(ws.t_field.value[:, 0, 0]))
+        retrieved_y.append(np.copy(ws.y.value))
+        retrieved_jacobian.append(np.copy(ws.jacobian.value))
+    ws.WriteXML("ascii", retrieved_h2o_vmr, "retrieval_output/retrieved_h2o_vmr.xml")
+    ws.WriteXML("ascii", retrieved_t, "retrieval_output/retrieved_temperature.xml")
+    ws.WriteXML("ascii", retrieved_y, "retrieval_output/retrieved_y.xml")
+    ws.WriteXML("ascii", retrieved_jacobian, "retrieval_output/retrieved_jacobian.xml")
 
     return ws
+
+
+def radiance2planck_bt_wavenumber(r, wavenumber):
+    c = constants.speed_of_light
+    k = constants.boltzmann
+    h = constants.planck
+    return h / k * c * wavenumber / np.log(np.divide(2 * h * c**2 * wavenumber**3, r) + 1)
+
 
 #def plot_retrieval_results():
