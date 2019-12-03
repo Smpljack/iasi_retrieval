@@ -4,6 +4,7 @@ import os
 from typhon.arts.workspace import arts_agenda
 from typhon.physics import wavenumber2frequency, frequency2wavenumber, constants
 
+
 def setup_retrieval_paths(project_path, project_name):
     """
     Setup the directory infrastructure for the retrieval project I am working on.
@@ -30,8 +31,7 @@ def load_abs_lookup(ws, atm_batch_path=None, abs_lookup_path=None, f_ranges=None
                       f"{int(frequency2wavenumber(freq[1]) / 100)}" for freq in f_ranges])
     if not abs_lookup_path:
         abs_lookup_path = "/scratch/uni/u237/users/mprange/phd/iasi_retrieval/abs_lookup_tables/" \
-                          f"abs_lookup_{os.path.basename(atm_batch_path).split(os.extsep, 1)[0]}_{f_str}_cm-1_" \
-                          f"sfc_channels.xml"
+                          f"abs_lookup_{os.path.basename(atm_batch_path).split(os.extsep, 1)[0]}_{f_str}_cm-1.xml"
     if os.path.isfile(abs_lookup_path):
         ws.ReadXML(ws.abs_lookup, abs_lookup_path)
         ws = abs_setup(ws)
@@ -45,8 +45,8 @@ def load_abs_lookup(ws, atm_batch_path=None, abs_lookup_path=None, f_ranges=None
                                cutoff=750e9)
         ws.abs_linesReadFromSplitArtscat(
             basename='/scratch/uni/u237/data/catalogue/hitran/hitran_split_artscat5/',
-            fmin=f_ranges[0][0],
-            fmax=f_ranges[-1][-1])
+            fmin=(np.min(ws.f_grid.value) - ws.f_backend_width * 10)[0],
+            fmax=(np.max(ws.f_grid.value) + ws.f_backend_width * 10)[0])
         ws.abs_lines_per_speciesCreateFromLines()
         ws.abs_lookupSetupBatch()
         ws.abs_xsec_agenda_checkedCalc()
@@ -55,7 +55,7 @@ def load_abs_lookup(ws, atm_batch_path=None, abs_lookup_path=None, f_ranges=None
     return ws
 
 
-def setup_sensor(ws, f_ranges, f_backend_width):
+def setup_sensor(ws, f_backend_width, f_ranges=None, add_frequencies=None):
     """
     Setup the sensor properties, mainly including the frequency grid.
     :param ws:
@@ -66,16 +66,23 @@ def setup_sensor(ws, f_ranges, f_backend_width):
     ws.sensor_pos = np.array([[850e3]])  # 850km
     ws.sensor_time = np.array([0.0])
     ws.sensor_los = np.array([[180.0]])  # nadir viewing
-    ws.f_grid = np.concatenate([np.arange(freq[0] * 0.99,
-                                          freq[1] * 1.01,
-                                          f_backend_width) for freq in f_ranges])
-    ws.f_backend = np.concatenate([np.arange(freq[0],
-                                             freq[1],
-                                             f_backend_width) for freq in f_ranges])
-    full_spec = np.arange(wavenumber2frequency(645.0 * 100),
-                          wavenumber2frequency(2760.0 * 100),
-                          f_backend_width)
-    ws.f_backend = np.sort(np.append(ws.f_backend.value, full_spec[np.array([1026, 1190, 1193, 1270, 1883])]))
+    if f_ranges is not None:
+        ws.f_backend = np.concatenate([np.arange(freq[0],
+                                                 freq[1],
+                                                 f_backend_width) for freq in f_ranges])
+    else:
+        ws.f_backend = np.array([])
+
+    if add_frequencies is not None:
+        ws.f_backend = np.unique(np.sort(np.append(ws.f_backend.value, add_frequencies)))
+        ws.f_grid = ws.f_backend
+        ws.f_grid = np.append(ws.f_grid.value,
+                              np.arange(np.min(ws.f_grid.value) - 10*f_backend_width,
+                                        np.min(ws.f_grid.value), f_backend_width))
+        ws.f_grid = np.append(ws.f_grid.value,
+                              np.arange(np.max(ws.f_grid.value) + f_backend_width,
+                                        np.max(ws.f_grid.value) + 11 * f_backend_width, f_backend_width))
+        ws.f_grid = np.sort(ws.f_grid.value)
     ws.f_backend_width = np.array([f_backend_width])
     ws.backend_channel_responseGaussian(ws.f_backend_width)
 
@@ -104,22 +111,8 @@ def load_generic_settings(ws, py_surface_agenda=False):
 
     # cosmic background radiation
     ws.Copy(ws.iy_space_agenda, ws.iy_space_agenda__CosmicBackground)
-
-    if py_surface_agenda:
-        @arts_agenda
-        def iy_surface_agendaPY(ws):
-            ws.SurfaceBlackbody()
-            ws.iySurfaceRtpropCalc()
-        ws.Copy(ws.iy_surface_agenda, iy_surface_agendaPY)
-    else:
-        # standard surface agenda (i.e., make use of surface_rtprop_agenda)
-        ws.Copy(ws.iy_surface_agenda, ws.iy_surface_agenda__UseSurfaceRtprop)
-
-    #if py_surface_agenda:
-        # snames = ["Water skin temperature", "Wind speed", "Salinity", "Wind direction"]
-        # sdata = np.array([ws.t_field.value[0, 0, 0], 3.4, 0.035, 0]).reshape(4, 1, 1)
-        # ws.Copy(ws.surface_props_names, snames)
-        # ws.Copy(ws.surface_props_data, sdata)
+    # standard surface agenda (i.e., make use of surface_rtprop_agenda)
+    ws.Copy(ws.iy_surface_agenda, ws.iy_surface_agenda__UseSurfaceRtprop)
 
     ws.Copy(ws.surface_rtprop_agenda, ws.surface_rtprop_agenda__Specular_NoPol_ReflFix_SurfTFromt_surface)
 
@@ -255,6 +248,25 @@ def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, cov_h2o
     ws.AbsInputFromAtmFields()
     ws.Extract(ws.z_surface, ws.z_field, 0)
     ws.Extract(ws.t_surface, ws.t_field, 0)
+    if "t_surface" in retrieval_quantities:
+        ws.surface_skin_t = ws.t_surface.value[0,0]
+        snames = ["skin temperature", "scalar reflectivity"]
+        sdata = np.array([ws.t_surface.value[0,0], ws.surface_scalar_reflectivity.value[0]]).reshape(2, 1, 1)
+        ws.Copy(ws.surface_props_names, snames)
+        ws.Copy(ws.surface_props_data, sdata)
+        @arts_agenda
+        def iy_surface_agendaPY(ws):
+
+            #ws.touch(ws.dsurface_rmatrix_dx)
+            ws.surfaceFlatScalarReflectivity()
+
+
+            ws.iySurfaceRtpropCalc()
+        ws.Copy(ws.iy_surface_agenda, iy_surface_agendaPY)
+        ws.retrievalAddSurfaceQuantity(quantity="skin temperature",
+                                       g1=ws.lat_grid,
+                                       g2=ws.lon_grid)
+        ws.covmat_sxAddBlock(block=np.array([[100]]))
     #ws.MatrixSetConstant(ws.t_surface, 1, 1, 300.)
     ws.atmfields_checkedCalc(bad_partition_functions_ok=1)
     ws.atmgeom_checkedCalc()
@@ -285,8 +297,8 @@ def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, cov_h2o
     cov_y = np.diag(np.ones(ws.f_backend.value.size))
     low_noise_ind = ws.f_backend.value < wavenumber2frequency(175000)
     high_noise_ind = ws.f_backend.value >= wavenumber2frequency(175000)
-    cov_y[low_noise_ind, low_noise_ind] *= 0.1
-    cov_y[high_noise_ind, high_noise_ind] *= 0.2
+    cov_y[low_noise_ind, low_noise_ind] *= 0.1**2
+    cov_y[high_noise_ind, high_noise_ind] *= 0.2**2
     ws.covmat_seAddBlock(block=cov_y)
     ws.retrievalDefClose()
     ws.WriteXML("ascii", ws.vmr_field, "a_priori/a_priori_vmr.xml")
@@ -301,7 +313,6 @@ def oem_retrieval(ws, ybatch_indices, inversion_method="lm", max_iter=20, gamma_
                   gamma_dec_factor=2.0, gamma_inc_factor=2.0, gamma_upper_limit=1e20,
                   gamma_lower_limit=1.0, gamma_upper_convergence_limit=99.0):
     """
-
     :param ws:
     :param ybatch_indices:
     :param inversion_method:
@@ -373,6 +384,8 @@ def oem_retrieval(ws, ybatch_indices, inversion_method="lm", max_iter=20, gamma_
     ws.WriteXML("ascii", retrieved_jacobian, "retrieval_output/retrieved_jacobian.xml")
 
     return ws
+
+#def save_current_atm_state_as_batch(ws, path):
 
 
 def radiance2planck_bt_wavenumber(r, wavenumber):
