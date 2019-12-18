@@ -1,8 +1,9 @@
 import numpy as np
 import os
+from scipy.linalg import inv
 
 from typhon.arts.workspace import arts_agenda
-from typhon.physics import wavenumber2frequency, frequency2wavenumber, constants
+from typhon.physics import wavenumber2frequency, frequency2wavenumber, constants, planck, radiance2planckTb
 
 
 def setup_retrieval_paths(project_path, project_name):
@@ -75,14 +76,14 @@ def setup_sensor(ws, f_backend_width, f_ranges=None, add_frequencies=None):
 
     if add_frequencies is not None:
         ws.f_backend = np.unique(np.sort(np.append(ws.f_backend.value, add_frequencies)))
-        ws.f_grid = ws.f_backend
-        ws.f_grid = np.append(ws.f_grid.value,
-                              np.arange(np.min(ws.f_grid.value) - 10*f_backend_width,
-                                        np.min(ws.f_grid.value), f_backend_width))
-        ws.f_grid = np.append(ws.f_grid.value,
-                              np.arange(np.max(ws.f_grid.value) + f_backend_width,
-                                        np.max(ws.f_grid.value) + 11 * f_backend_width, f_backend_width))
-        ws.f_grid = np.sort(ws.f_grid.value)
+    ws.f_grid = ws.f_backend
+    ws.f_grid = np.append(ws.f_grid.value,
+                          np.arange(np.min(ws.f_grid.value) - 10*f_backend_width,
+                                    np.min(ws.f_grid.value), f_backend_width))
+    ws.f_grid = np.append(ws.f_grid.value,
+                          np.arange(np.max(ws.f_grid.value) + f_backend_width,
+                                    np.max(ws.f_grid.value) + 11 * f_backend_width, f_backend_width))
+    ws.f_grid = np.sort(ws.f_grid.value)
     ws.f_backend_width = np.array([f_backend_width])
     ws.backend_channel_responseGaussian(ws.f_backend_width)
 
@@ -130,11 +131,11 @@ def load_generic_settings(ws, py_surface_agenda=False):
     ws.jacobian_quantities = []
     ws.iy_unit = "PlanckBT"
     ws.cloudboxOff()
-    ws.surface_scalar_reflectivity = np.array([0.01])  # nominal albedo for surface
+    ws.surface_scalar_reflectivity = np.array([0.05])  # nominal albedo for surface
     return ws
 
 
-def iasi_observation(ws, atm_batch_path, n_atmospheres, f_ranges, iasi_obs_path=None):
+def iasi_observation(ws, atm_batch_path, n_atmospheres, f_ranges, t_surface=None, iasi_obs_path=None):
     """
     iasi observation simulation
     :param ws:
@@ -154,6 +155,7 @@ def iasi_observation(ws, atm_batch_path, n_atmospheres, f_ranges, iasi_obs_path=
         ws.ReadXML(ws.batch_atm_fields_compact, atm_batch_path)
         ws = abs_setup(ws)
         ws.propmat_clearsky_agenda_checkedCalc()
+        atm_ind = 0
         @arts_agenda
         def ybatch_calc_agenda(ws):
             ws.Extract(ws.atm_fields_compact,
@@ -170,8 +172,8 @@ def iasi_observation(ws, atm_batch_path, n_atmospheres, f_ranges, iasi_obs_path=
             ws.jacobianClose()
             ws.Extract(ws.z_surface, ws.z_field, 0)
             ws.Extract(ws.t_surface, ws.t_field, 0)
-
-            #ws.MatrixSetConstant(ws.t_surface, 1, 1, 300.)
+            if t_surface is not None:
+                ws.MatrixSetConstant(ws.t_surface, 1, 1, t_surface)
             ws.atmfields_checkedCalc(bad_partition_functions_ok=1)
             ws.atmgeom_checkedCalc()
             ws.cloudbox_checkedCalc()
@@ -224,7 +226,8 @@ def abs_setup(ws):
     return ws
 
 
-def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, cov_h2o_vmr, cov_t, retrieval_quantities):
+def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, retrieval_quantities,
+                        cov_cross=None, cov_h2o_vmr=None, cov_t=None, cov_t_surface=None, cov_y_t_surface=None):
     """
 
     :param ws:
@@ -248,68 +251,59 @@ def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, cov_h2o
     ws.AbsInputFromAtmFields()
     ws.Extract(ws.z_surface, ws.z_field, 0)
     ws.Extract(ws.t_surface, ws.t_field, 0)
-    if "t_surface" in retrieval_quantities:
-        ws.surface_skin_t = ws.t_surface.value[0,0]
-        snames = ["skin temperature", "scalar reflectivity"]
-        sdata = np.array([ws.t_surface.value[0,0], ws.surface_scalar_reflectivity.value[0]]).reshape(2, 1, 1)
-        ws.Copy(ws.surface_props_names, snames)
-        ws.Copy(ws.surface_props_data, sdata)
-        @arts_agenda
-        def iy_surface_agendaPY(ws):
-
-            #ws.touch(ws.dsurface_rmatrix_dx)
-            ws.surfaceFlatScalarReflectivity()
-
-
-            ws.iySurfaceRtpropCalc()
-        ws.Copy(ws.iy_surface_agenda, iy_surface_agendaPY)
-        ws.retrievalAddSurfaceQuantity(quantity="skin temperature",
-                                       g1=ws.lat_grid,
-                                       g2=ws.lon_grid)
-        ws.covmat_sxAddBlock(block=np.array([[100]]))
-    #ws.MatrixSetConstant(ws.t_surface, 1, 1, 300.)
     ws.atmfields_checkedCalc(bad_partition_functions_ok=1)
     ws.atmgeom_checkedCalc()
     ws.cloudbox_checkedCalc()
     ws.sensor_checkedCalc()
     ws.propmat_clearsky_agenda_checkedCalc()
-    ws.retrievalDefInit()
-    if "Temperature" in retrieval_quantities:
-        ws.retrievalAddTemperature(
-            g1=ws.p_grid,
-            g2=ws.lat_grid,
-            g3=ws.lon_grid)
-        ws.covmat_sxAddBlock(block=cov_t)
-    if "H2O" in retrieval_quantities:
-        ws.retrievalAddAbsSpecies(species="H2O, H2O-SelfContCKDMT252, H2O-ForeignContCKDMT252",
-                                  unit="vmr",
-                                  g1=ws.p_grid,
-                                  g2=ws.lat_grid,
-                                  g3=ws.lon_grid)
-        ws.jacobianSetFuncTransformation(transformation_func="log10")
-        ws.covmat_sxAddBlock(block=cov_h2o_vmr)
-    #ws.Append(ws.surface_props_data, ws.t_surface)
-    #ws.Append(ws.surface_props_names, "t_surface")
-    #ws.retrievalAddSurfaceQuantity(quantity="t_surface",
-    #                               g1=ws.lat_grid,
-    #                               g2=ws.lon_grid)
-    #ws.covmat_sxAddBlock(block=np.array([[100]]))
-    cov_y = np.diag(np.ones(ws.f_backend.value.size))
-    low_noise_ind = ws.f_backend.value < wavenumber2frequency(175000)
-    high_noise_ind = ws.f_backend.value >= wavenumber2frequency(175000)
-    cov_y[low_noise_ind, low_noise_ind] *= 0.1**2
-    cov_y[high_noise_ind, high_noise_ind] *= 0.2**2
-    ws.covmat_seAddBlock(block=cov_y)
-    ws.retrievalDefClose()
+    if "t_surface" in retrieval_quantities:
+        ws = get_transmittance(ws)
+        ws.MatrixCreate("cov_t_surface")
+        ws.MatrixCreate("cov_y_t_surface")
+        ws.cov_t_surface = cov_t_surface
+        ws.cov_y_t_surface = cov_y_t_surface
+    if "Temperature" in retrieval_quantities or "H2O" in retrieval_quantities:
+        ws.retrievalDefInit()
+        if "Temperature" in retrieval_quantities:
+            ws.retrievalAddTemperature(
+                g1=ws.p_grid,
+                g2=ws.lat_grid,
+                g3=ws.lon_grid)
+            ws.covmat_sxAddBlock(block=cov_t)
+        if "H2O" in retrieval_quantities:
+            ws.retrievalAddAbsSpecies(species="H2O, H2O-SelfContCKDMT252, H2O-ForeignContCKDMT252",
+                                      unit="vmr",
+                                      g1=ws.p_grid,
+                                      g2=ws.lat_grid,
+                                      g3=ws.lon_grid)
+            ws.jacobianSetFuncTransformation(transformation_func="log10")
+            ws.covmat_sxAddBlock(block=cov_h2o_vmr)
+
+        #ws.Append(ws.surface_props_data, ws.t_surface)
+        #ws.Append(ws.surface_props_names, "t_surface")
+        #ws.retrievalAddSurfaceQuantity(quantity="t_surface",
+        #                               g1=ws.lat_grid,
+        #                               g2=ws.lon_grid)
+        #ws.covmat_sxAddBlock(block=np.array([[100]]))
+        if cov_cross is not None:
+            ws.covmat_sxAddBlock(block=cov_cross, i=0, j=1)
+        cov_y = np.diag(np.ones(ws.f_backend.value.size))
+        low_noise_ind = ws.f_backend.value < wavenumber2frequency(175000)
+        high_noise_ind = ws.f_backend.value >= wavenumber2frequency(175000)
+        cov_y[low_noise_ind, low_noise_ind] *= 0.1**2
+        cov_y[high_noise_ind, high_noise_ind] *= 0.2**2
+        ws.covmat_seAddBlock(block=cov_y)
+        ws.retrievalDefClose()
     ws.WriteXML("ascii", ws.vmr_field, "a_priori/a_priori_vmr.xml")
     ws.WriteXML("ascii", ws.t_field, "a_priori/a_priori_temperature.xml")
     ws.WriteXML("ascii", ws.p_grid, "a_priori/a_priori_p.xml")
     ws.WriteXML("ascii", ws.z_field.value[:,0,0], "a_priori/a_priori_z.xml")
     ws.WriteXML("ascii", cov_y, "sensor/covariance_y.xml")
+    ws.WriteXML("ascii", ws.covmat_sx, "a_priori/covmat_sx.xml")
     return ws
 
 
-def oem_retrieval(ws, ybatch_indices, inversion_method="lm", max_iter=20, gamma_start=1000,
+def oem_retrieval(ws, ybatch_indices, t_surface=None, inversion_method="lm", max_iter=20, gamma_start=1000,
                   gamma_dec_factor=2.0, gamma_inc_factor=2.0, gamma_upper_limit=1e20,
                   gamma_lower_limit=1.0, gamma_upper_convergence_limit=99.0):
     """
@@ -331,7 +325,7 @@ def oem_retrieval(ws, ybatch_indices, inversion_method="lm", max_iter=20, gamma_
         ws.Ignore(ws.inversion_iteration_counter)
         ws.x2artsAtmAndSurf()
         #ws.Extract(ws.t_surface, ws.t_field, 0)
-        ws.t_surface = np.asarray(ws.t_field)[0]
+        #ws.t_surface = np.asarray(ws.t_field)[0]
         print("atm0:" + str(ws.t_field.value[0,0,0]))
         print("t_surface:" + str(ws.t_surface.value[0,0]))
         # to be safe, rerun checks dealing with atmosph.
@@ -352,10 +346,15 @@ def oem_retrieval(ws, ybatch_indices, inversion_method="lm", max_iter=20, gamma_
     retrieved_jacobian = []
     vmr_a_priori = np.copy(ws.vmr_field.value)
     t_a_priori = np.copy(ws.t_field.value)
-    for obs in np.array(ws.ybatch.value)[ybatch_indices]:
+    for enum, obs in enumerate(np.array(ws.ybatch.value)[ybatch_indices]):
         ws.y = np.copy(obs)
         ws.vmr_field.value = np.copy(vmr_a_priori)
         ws.t_field.value = np.copy(t_a_priori)
+        # Check for existence of transmittance variable,
+        # which is only created when t_surface is retrieved.
+        if t_surface is not None:
+            ws.t_surface.value[0, 0] = np.copy(t_surface[enum])
+            #ws.t_field.value[0, 0, 0] = np.copy(t_surface[enum])
         ws.xaStandard()  # a_priori vector is current state of retrieval fields in ws, but transformed
         ws.x = np.array([])  # create empty vector for retrieved state vector?
         ws.yf = np.array([])  # create empty vector for simulated TB?
@@ -395,4 +394,102 @@ def radiance2planck_bt_wavenumber(r, wavenumber):
     return h / k * c * wavenumber / np.log(np.divide(2 * h * c**2 * wavenumber**3, r) + 1)
 
 
+def get_transmittance(ws):
+    ws.MatrixCreate("t_surface_a")
+    ws.t_surface_a = np.copy(ws.t_surface.value)
+    ws.jacobianOff()
+    ws.yCalc()
+    ws.MatrixCreate("planck_a")
+    ws.MatrixPlanck(ws.planck_a, ws.stokes_dim, ws.f_backend.value, ws.t_surface_a.value[0, 0])
+    ws.VectorCreate("transmittance")
+    ws.transmittance = planck(ws.f_backend.value, ws.y.value) / ws.planck_a.value[:, 0] / \
+                       (1 - ws.surface_scalar_reflectivity.value)
+    return ws
+
+
+def oem_t_surface(ws, ybatch_indices, max_iter):
+    Sa = ws.cov_t_surface.value
+    Sy = ws.cov_y_t_surface.value
+    ws.MatrixCreate("jacobian_Ts")
+    retrieved_Ts = []
+    for obs in np.array(ws.ybatch.value)[ybatch_indices]:
+        ws.y = np.copy(obs)
+        ws.t_surface.value = np.copy(ws.t_surface_a.value)
+        not_converged = True
+        print(f"t_surface_apriori={ws.t_surface.value}")
+        iter_n = 0
+        while not_converged:
+            iter_n += 1
+            ws.jacobian_Ts = np.array([(ws.transmittance.value * (1 - ws.surface_scalar_reflectivity.value))]).T
+                             #np.array([planck_derivative_T(ws.f_backend.value, ws.t_surface.value[0, 0]) *
+                             #          ws.transmittance.value * (1 - ws.surface_scalar_reflectivity.value)]).T
+            ws.t_surface = gauss_newton_t_surface(ws, Sa, Sy)
+            print(f"iter{iter_n}, t_surface={ws.t_surface.value}")
+            print(f"iter{iter_n}, cost={eval_cost_function(ws, Sa, Sy)}")
+            if iter_n == max_iter:
+                break
+        retrieved_Ts.append(np.array([np.copy(ws.t_surface.value[0, 0])]))
+    ws.WriteXML("ascii", retrieved_Ts, "retrieval_output/retrieved_t_surface.xml")
+
+
+def planck_derivative_T(f, T):
+    c = constants.speed_of_light
+    k = constants.boltzmann
+    h = constants.planck
+    return 2 * h**2 * f**4 / (c**2 * k * T**2) * np.exp(h * f / (k * T)) / (np.exp(h * f / (k * T)) - 1)**2
+
+
+def gauss_newton_t_surface(ws, Sa, Sy):
+    yi = radiance2planckTb(ws.f_backend.value, planck(ws.f_backend.value, ws.t_surface.value[0, 0]) *
+                           ws.transmittance.value * (1 - ws.surface_scalar_reflectivity.value))
+    return \
+        ws.t_surface_a.value + inv(inv(Sa) + ws.jacobian_Ts.value.T @ inv(Sy) @ ws.jacobian_Ts.value) @ \
+        ws.jacobian_Ts.value.T @ inv(Sy) @ \
+        (ws.y.value - yi +
+         ws.jacobian_Ts.value @ (ws.t_surface.value[:, 0] - ws.t_surface_a.value[:, 0]))
+
+
+def eval_cost_function(ws, Sa, Sy):
+    yi = radiance2planckTb(ws.f_backend.value, planck(ws.f_backend.value, ws.t_surface.value[0, 0]) *
+                           ws.transmittance.value * (1 - ws.surface_scalar_reflectivity.value))
+    return (ws.y.value - yi).T @ inv(Sy) @ (ws.y.value - yi) + \
+           (ws.t_surface.value[:, 0] - ws.t_surface_a.value[:, 0])**2 @ inv(Sa)
 #def plot_retrieval_results():
+
+
+def corr_length_cov(z, trpp=12.5e3):
+    """Return correlation lengths for given altitudes.
+    Parameters:
+        z (np.array): Height levels [m]
+        trpp (float): Tropopause height [m]
+
+    Returns:
+        np.array: Correlation length for each heigth level.
+
+    """
+    f = np.poly1d(np.polyfit(x=(0, trpp), y=(2.5e3, 10e3), deg=1))
+    cl = f(z)
+    cl[z > trpp] = 10e3
+
+    return cl
+
+
+def covmat_cross(covmat_h2o, covmat_t, z_grid, corr_height=1500.):
+    """
+    Return cross-covariance block for given H2O and Temperature
+    covariance matrices. The cross-covariances drop exponentially
+    with height (1/e at corr_height) and correlation length approach
+    is used for determining non-diagonal entries.
+    """
+    S = np.zeros(covmat_t.shape)
+    S[np.diag_indices_from(S)] = [np.sqrt(covmat_h2o[0, 0] * covmat_t[0, 0]) * np.exp(-1 / corr_height * z_grid[i])
+                                  for i in range(len(z_grid))]
+
+    cl = corr_length_cov(z_grid)
+    for i in range(S.shape[1]):
+        for j in range(S.shape[0]):
+            cl_mean = (cl[i] + cl[j]) / 2
+            s = (S[j, j] + S[i, i]) / 2
+            S[i, j] = s * np.exp(-np.abs(z_grid[i] - z_grid[j]) / cl_mean)
+
+    return S
