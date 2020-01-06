@@ -96,7 +96,7 @@ def setup_sensor(ws, f_backend_width, f_ranges=None, add_frequencies=None):
     return ws
 
 
-def load_generic_settings(ws, py_surface_agenda=False):
+def load_generic_settings(ws):
     """
     Load generic agendas and set generic settings.
     :param ws:
@@ -227,7 +227,8 @@ def abs_setup(ws):
 
 
 def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, retrieval_quantities,
-                        cov_cross=None, cov_h2o_vmr=None, cov_t=None, cov_t_surface=None, cov_y_t_surface=None):
+                        cov_cross=None, cov_h2o_vmr=None, cov_t=None, cov_t_surface=None, cov_y_t_surface=None,
+                        t_surface=None):
     """
 
     :param ws:
@@ -250,7 +251,10 @@ def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, retriev
     # ws.AtmFieldsCalc()
     ws.AbsInputFromAtmFields()
     ws.Extract(ws.z_surface, ws.z_field, 0)
-    ws.Extract(ws.t_surface, ws.t_field, 0)
+    if t_surface is not None:
+        ws.t_surface = t_surface
+    else:
+        ws.Extract(ws.t_surface, ws.t_field, 0)
     ws.atmfields_checkedCalc(bad_partition_functions_ok=1)
     ws.atmgeom_checkedCalc()
     ws.cloudbox_checkedCalc()
@@ -294,12 +298,12 @@ def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, retriev
         cov_y[high_noise_ind, high_noise_ind] *= 0.2**2
         ws.covmat_seAddBlock(block=cov_y)
         ws.retrievalDefClose()
+        ws.WriteXML("ascii", cov_y, "sensor/covariance_y.xml")
+        ws.WriteXML("ascii", ws.covmat_sx, "a_priori/covmat_sx.xml")
     ws.WriteXML("ascii", ws.vmr_field, "a_priori/a_priori_vmr.xml")
     ws.WriteXML("ascii", ws.t_field, "a_priori/a_priori_temperature.xml")
     ws.WriteXML("ascii", ws.p_grid, "a_priori/a_priori_p.xml")
-    ws.WriteXML("ascii", ws.z_field.value[:,0,0], "a_priori/a_priori_z.xml")
-    ws.WriteXML("ascii", cov_y, "sensor/covariance_y.xml")
-    ws.WriteXML("ascii", ws.covmat_sx, "a_priori/covmat_sx.xml")
+    ws.WriteXML("ascii", ws.z_field.value[:, 0, 0], "a_priori/a_priori_z.xml")
     return ws
 
 
@@ -325,7 +329,7 @@ def oem_retrieval(ws, ybatch_indices, t_surface=None, inversion_method="lm", max
         ws.Ignore(ws.inversion_iteration_counter)
         ws.x2artsAtmAndSurf()
         #ws.Extract(ws.t_surface, ws.t_field, 0)
-        #ws.t_surface = np.asarray(ws.t_field)[0]
+        ws.t_surface = np.asarray(ws.t_field)[0]
         print("atm0:" + str(ws.t_field.value[0,0,0]))
         print("t_surface:" + str(ws.t_surface.value[0,0]))
         # to be safe, rerun checks dealing with atmosph.
