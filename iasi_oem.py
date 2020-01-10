@@ -96,7 +96,7 @@ def setup_sensor(ws, f_backend_width, f_ranges=None, add_frequencies=None):
     return ws
 
 
-def load_generic_settings(ws):
+def load_generic_settings(ws,):
     """
     Load generic agendas and set generic settings.
     :param ws:
@@ -112,6 +112,7 @@ def load_generic_settings(ws):
 
     # cosmic background radiation
     ws.Copy(ws.iy_space_agenda, ws.iy_space_agenda__CosmicBackground)
+
     # standard surface agenda (i.e., make use of surface_rtprop_agenda)
     ws.Copy(ws.iy_surface_agenda, ws.iy_surface_agenda__UseSurfaceRtprop)
 
@@ -228,7 +229,7 @@ def abs_setup(ws):
 
 def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, retrieval_quantities,
                         cov_cross=None, cov_h2o_vmr=None, cov_t=None, cov_t_surface=None, cov_y_t_surface=None,
-                        t_surface=None):
+                        t_surface=None, py_surface_agenda=False):
     """
 
     :param ws:
@@ -266,6 +267,23 @@ def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, retriev
         ws.MatrixCreate("cov_y_t_surface")
         ws.cov_t_surface = cov_t_surface
         ws.cov_y_t_surface = cov_y_t_surface
+        if py_surface_agenda:
+            # Self defined surface agenda, used for surface Temperature retrieval.
+            ws.Tensor4Create("rmatrix_dummy")
+            ws.Tensor4SetConstant(ws.rmatrix_dummy, 1, len(ws.f_grid.value), 1, 1, 0.)
+            ws.MatrixCreate("surface_jacobian_dummy")
+            ws.surface_jacobian_dummy = np.repmat(np.array([1. - ws.surface_scalar_reflectivity.value]),
+                                                  len(ws.f_grid.value), 1)
+
+            @arts_agenda
+            def iy_surface_agenda_PY(ws):
+                ws.surfaceFlatScalarReflectivity()
+                # DOESNT WORK: API issue? f_grid is initialized, but not within agenda definiton?
+                ws.Append(ws.dsurface_rmatrix_dx, ws.rmatrix_dummy)
+                #ws.dsurface_rmatrix_dx = [np.zeros(1, 10, 1, 1)]
+                ws.iySurfaceRtpropCalc()
+
+            ws.Copy(ws.iy_surface_agenda, iy_surface_agenda_PY)
     if "Temperature" in retrieval_quantities or "H2O" in retrieval_quantities:
         ws.retrievalDefInit()
         if "Temperature" in retrieval_quantities:
