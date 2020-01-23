@@ -1,7 +1,7 @@
-import numpy as np
 import os
-from scipy.linalg import inv
 
+import numpy as np
+from scipy.linalg import inv
 from typhon.arts.workspace import arts_agenda
 from typhon.physics import wavenumber2frequency, frequency2wavenumber, constants, planck, radiance2planckTb
 
@@ -41,16 +41,21 @@ def load_abs_lookup(ws, atm_batch_path=None, abs_lookup_path=None, f_ranges=None
         ws.ReadXML(ws.batch_atm_fields_compact,
                    atm_batch_path)
         ws = abs_setup(ws)
-        ws.abs_lineshapeDefine(shape=line_shape,
-                               forefactor='VVH',
-                               cutoff=750e9)
-        ws.abs_linesReadFromSplitArtscat(
+        # ws.abs_lineshapeDefine(shape=line_shape,
+        #                        forefactor='VVH',
+        #                        cutoff=750e9)
+        ws.ReadSplitARTSCAT(
             basename='/scratch/uni/u237/data/catalogue/hitran/hitran_split_artscat5/',
             fmin=(np.min(ws.f_grid.value) - ws.f_backend_width * 10)[0],
-            fmax=(np.max(ws.f_grid.value) + ws.f_backend_width * 10)[0])
+            fmax=(np.max(ws.f_grid.value) + ws.f_backend_width * 10)[0],
+            globalquantumnumbers="",
+            localquantumnumbers="",
+            ignore_missing=0,
+        )
         ws.abs_lines_per_speciesCreateFromLines()
         ws.abs_lookupSetupBatch()
         ws.abs_xsec_agenda_checkedCalc()
+        ws.lbl_checkedCalc()
         ws.abs_lookupCalc()
         ws.WriteXML("binary", ws.abs_lookup, abs_lookup_path)
     return ws
@@ -113,8 +118,14 @@ def load_generic_settings(ws,):
     # cosmic background radiation
     ws.Copy(ws.iy_space_agenda, ws.iy_space_agenda__CosmicBackground)
 
+    @arts_agenda
+    def iy_surface_agenda_PY(ws):
+        ws.SurfaceBlackbody()
+        ws.iySurfaceRtpropCalc()
+
+    ws.Copy(ws.iy_surface_agenda, iy_surface_agenda_PY)
     # standard surface agenda (i.e., make use of surface_rtprop_agenda)
-    ws.Copy(ws.iy_surface_agenda, ws.iy_surface_agenda__UseSurfaceRtprop)
+    #ws.Copy(ws.iy_surface_agenda, ws.iy_surface_agenda__UseSurfaceRtprop)
 
     ws.Copy(ws.surface_rtprop_agenda, ws.surface_rtprop_agenda__Specular_NoPol_ReflFix_SurfTFromt_surface)
 
@@ -132,11 +143,12 @@ def load_generic_settings(ws,):
     ws.jacobian_quantities = []
     ws.iy_unit = "PlanckBT"
     ws.cloudboxOff()
-    ws.surface_scalar_reflectivity = np.array([0.05])  # nominal albedo for surface
+    ws.surface_scalar_reflectivity = np.array([0.])  # nominal albedo for surface
     return ws
 
 
-def iasi_observation(ws, atm_batch_path, n_atmospheres, f_ranges, t_surface=None, iasi_obs_path=None):
+def iasi_observation(ws, f_ranges, atm_batch_path, n_atmospheres=None, t_surface=None,
+                     iasi_obs_path=None, iasi_obs_data=None, add_measurement_noise=True):
     """
     iasi observation simulation
     :param ws:
@@ -152,19 +164,23 @@ def iasi_observation(ws, atm_batch_path, n_atmospheres, f_ranges, t_surface=None
 
     if iasi_obs_path:
         ws.ReadXML(ws.ybatch, iasi_obs_path)
+    elif iasi_obs_data is not None:
+        ws.Copy(ws.ybatch, iasi_obs_data)
     else:
         ws.ReadXML(ws.batch_atm_fields_compact, atm_batch_path)
         ws = abs_setup(ws)
         ws.propmat_clearsky_agenda_checkedCalc()
         atm_ind = 0
+        #ws.execute_controlfile("/scratch/uni/u237/users/mprange/phd/iasi_retrieval/ybatch_agenda.arts")
+
+        ws.VectorCreate("t_surface_vector")
+        ws.NumericCreate("t_surface_numeric")
         @arts_agenda
         def ybatch_calc_agenda(ws):
             ws.Extract(ws.atm_fields_compact,
                        ws.batch_atm_fields_compact,
                        ws.ybatch_index)
             ws.AtmFieldsAndParticleBulkPropFieldFromCompact()
-
-            # ws.jacobianOff()
             ws.jacobianInit()
             ws.jacobianAddTemperature(g1=ws.p_grid, g2=ws.lat_grid, g3=ws.lon_grid)
             ws.jacobianAddAbsSpecies(species="H2O, H2O-SelfContCKDMT252, H2O-ForeignContCKDMT252",
@@ -173,26 +189,27 @@ def iasi_observation(ws, atm_batch_path, n_atmospheres, f_ranges, t_surface=None
             ws.jacobianClose()
             ws.Extract(ws.z_surface, ws.z_field, 0)
             ws.Extract(ws.t_surface, ws.t_field, 0)
-            if t_surface is not None:
-                ws.MatrixSetConstant(ws.t_surface, 1, 1, t_surface)
+            ws.Copy(ws.surface_props_names, ["Skin temperature"])
+            ws.VectorExtractFromMatrix(ws.t_surface_vector, ws.t_surface, 0, "row")
+            ws.Extract(ws.t_surface_numeric, ws.t_surface_vector, 0)
+            ws.Tensor3SetConstant(ws.surface_props_data, 1, 1, 1, ws.t_surface_numeric)
             ws.atmfields_checkedCalc(bad_partition_functions_ok=1)
             ws.atmgeom_checkedCalc()
             ws.cloudbox_checkedCalc()
             ws.sensor_checkedCalc()
             ws.yCalc()
-            #ws.jacobianAdjustAndTransform()
-
         ws.Copy(ws.ybatch_calc_agenda, ybatch_calc_agenda)
         ws.IndexSet(ws.ybatch_n, n_atmospheres)  # Amount of atmospheres
         ws.ybatchCalc()
         # Add measurement noise to synthetic observation
-        for i in range(n_atmospheres):
-            ws.ybatch.value[i][ws.f_backend.value < wavenumber2frequency(175000)] += \
-                np.array([np.random.normal(loc=0.0, scale=0.1)
-                          for i in range(np.sum(ws.f_backend.value < wavenumber2frequency(175000)))])
-            ws.ybatch.value[i][ws.f_backend.value >= wavenumber2frequency(175000)] += \
-                np.array([np.random.normal(loc=0.0, scale=0.2)
-                          for i in range(np.sum(ws.f_backend.value >= wavenumber2frequency(175000)))])
+        if add_measurement_noise:
+            for i in range(n_atmospheres):
+                ws.ybatch.value[i][ws.f_backend.value < wavenumber2frequency(175000)] += \
+                    np.array([np.random.normal(loc=0.0, scale=0.1)
+                              for i in range(np.sum(ws.f_backend.value < wavenumber2frequency(175000)))])
+                ws.ybatch.value[i][ws.f_backend.value >= wavenumber2frequency(175000)] += \
+                    np.array([np.random.normal(loc=0.0, scale=0.2)
+                              for i in range(np.sum(ws.f_backend.value >= wavenumber2frequency(175000)))])
         ws.WriteXML("ascii", ws.ybatch_jacobians,
                     f"observations/{batch_atm_fields_name}_{f_str}_cm-1_jacobian.xml")
         ws.WriteXML("ascii", ws.batch_atm_fields_compact,
@@ -221,15 +238,15 @@ def abs_setup(ws):
     ws.batch_atm_fields_compactAddConstant(name="abs_species-N2",
                                            value=0.7808,
                                            condensibles=["abs_species-H2O"])
-    #ws.batch_atm_fields_compactAddConstant(name="abs_species-CO2",
-    #                                       value=0.0004,
-    #                                       condensibles=["abs_species-H2O"])
+    ws.batch_atm_fields_compactAddConstant(name="abs_species-CO2",
+                                          value=0.0004,
+                                          condensibles=["abs_species-H2O"])
     return ws
 
 
 def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, retrieval_quantities,
-                        cov_cross=None, cov_h2o_vmr=None, cov_t=None, cov_t_surface=None, cov_y_t_surface=None,
-                        t_surface=None, py_surface_agenda=False):
+                        cov_cross=None, cov_h2o_vmr=None, cov_t=None, cov_t_surface=None, t_surface=None,
+                        t_profile=None, h2o_vmr_profile=None, z_grid=None, p_grid=None):
     """
 
     :param ws:
@@ -248,50 +265,46 @@ def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, retriev
     ws.AtmFieldsAndParticleBulkPropFieldFromCompact()
     ws.lat_grid = []
     ws.lon_grid = []
-    ws.p_grid = ws.atm_fields_compact.value.grids[1]
     # ws.AtmFieldsCalc()
     ws.AbsInputFromAtmFields()
-    ws.Extract(ws.z_surface, ws.z_field, 0)
     if t_surface is not None:
         ws.t_surface = t_surface
     else:
         ws.Extract(ws.t_surface, ws.t_field, 0)
+    ws.Extract(ws.z_surface, ws.z_field, 0)
     ws.atmfields_checkedCalc(bad_partition_functions_ok=1)
     ws.atmgeom_checkedCalc()
     ws.cloudbox_checkedCalc()
     ws.sensor_checkedCalc()
     ws.propmat_clearsky_agenda_checkedCalc()
-    if "t_surface" in retrieval_quantities:
+    snames = ["Skin temperature"]
+    sdata = np.array([ws.t_surface.value])
+    ws.Copy(ws.surface_props_names, snames)
+    ws.Copy(ws.surface_props_data, sdata)
+
+    if "t_surface_python" in retrieval_quantities:
         ws = get_transmittance(ws)
         ws.MatrixCreate("cov_t_surface")
         ws.MatrixCreate("cov_y_t_surface")
         ws.cov_t_surface = cov_t_surface
-        ws.cov_y_t_surface = cov_y_t_surface
-        if py_surface_agenda:
-            # Self defined surface agenda, used for surface Temperature retrieval.
-            ws.Tensor4Create("rmatrix_dummy")
-            ws.Tensor4SetConstant(ws.rmatrix_dummy, 1, len(ws.f_grid.value), 1, 1, 0.)
-            ws.MatrixCreate("surface_jacobian_dummy")
-            ws.surface_jacobian_dummy = np.repmat(np.array([1. - ws.surface_scalar_reflectivity.value]),
-                                                  len(ws.f_grid.value), 1)
+        ws.cov_y_t_surface = 0.1 ** 2 * np.diag(np.ones(ws.f_backend.value.shape))
+        ws.WriteXML("ascii", ws.cov_y_t_surface.value, "sensor/covariance_y.xml")
+        ws.WriteXML("ascii", cov_t_surface, "a_priori/covmat_sx.xml")
 
-            @arts_agenda
-            def iy_surface_agenda_PY(ws):
-                ws.surfaceFlatScalarReflectivity()
-                # DOESNT WORK: API issue? f_grid is initialized, but not within agenda definiton?
-                ws.Append(ws.dsurface_rmatrix_dx, ws.rmatrix_dummy)
-                #ws.dsurface_rmatrix_dx = [np.zeros(1, 10, 1, 1)]
-                ws.iySurfaceRtpropCalc()
-
-            ws.Copy(ws.iy_surface_agenda, iy_surface_agenda_PY)
-    if "Temperature" in retrieval_quantities or "H2O" in retrieval_quantities:
+    else:
         ws.retrievalDefInit()
+        if "t_surface" in retrieval_quantities:
+            ws.retrievalAddSurfaceQuantity(
+                g1=ws.lat_grid, g2=ws.lon_grid, quantity=snames[0])
+            ws.covmat_sxAddBlock(block=cov_t_surface)
+
         if "Temperature" in retrieval_quantities:
             ws.retrievalAddTemperature(
                 g1=ws.p_grid,
                 g2=ws.lat_grid,
                 g3=ws.lon_grid)
             ws.covmat_sxAddBlock(block=cov_t)
+
         if "H2O" in retrieval_quantities:
             ws.retrievalAddAbsSpecies(species="H2O, H2O-SelfContCKDMT252, H2O-ForeignContCKDMT252",
                                       unit="vmr",
@@ -301,12 +314,6 @@ def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, retriev
             ws.jacobianSetFuncTransformation(transformation_func="log10")
             ws.covmat_sxAddBlock(block=cov_h2o_vmr)
 
-        #ws.Append(ws.surface_props_data, ws.t_surface)
-        #ws.Append(ws.surface_props_names, "t_surface")
-        #ws.retrievalAddSurfaceQuantity(quantity="t_surface",
-        #                               g1=ws.lat_grid,
-        #                               g2=ws.lon_grid)
-        #ws.covmat_sxAddBlock(block=np.array([[100]]))
         if cov_cross is not None:
             ws.covmat_sxAddBlock(block=cov_cross, i=0, j=1)
         cov_y = np.diag(np.ones(ws.f_backend.value.size))
@@ -325,7 +332,7 @@ def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, retriev
     return ws
 
 
-def oem_retrieval(ws, ybatch_indices, t_surface=None, inversion_method="lm", max_iter=20, gamma_start=1000,
+def oem_retrieval(ws, ybatch_indices, inversion_method="lm", max_iter=20, gamma_start=1000,
                   gamma_dec_factor=2.0, gamma_inc_factor=2.0, gamma_upper_limit=1e20,
                   gamma_lower_limit=1.0, gamma_upper_convergence_limit=99.0):
     """
@@ -346,10 +353,8 @@ def oem_retrieval(ws, ybatch_indices, t_surface=None, inversion_method="lm", max
     def inversion_agenda(ws):
         ws.Ignore(ws.inversion_iteration_counter)
         ws.x2artsAtmAndSurf()
-        #ws.Extract(ws.t_surface, ws.t_field, 0)
-        ws.t_surface = np.asarray(ws.t_field)[0]
-        print("atm0:" + str(ws.t_field.value[0,0,0]))
-        print("t_surface:" + str(ws.t_surface.value[0,0]))
+        #ws.Extract(ws.t_surface, ws.surface_props_data, 0)
+        #print(ws.t_surface.value)
         # to be safe, rerun checks dealing with atmosph.
         # Allow negative vmr? Allow temperatures < 150 K and > 300 K?
         ws.atmfields_checkedCalc(
@@ -364,6 +369,7 @@ def oem_retrieval(ws, ybatch_indices, t_surface=None, inversion_method="lm", max
 
     retrieved_h2o_vmr = []
     retrieved_t = []
+    retrieved_ts = []
     retrieved_y = []
     retrieved_jacobian = []
     vmr_a_priori = np.copy(ws.vmr_field.value)
@@ -372,11 +378,6 @@ def oem_retrieval(ws, ybatch_indices, t_surface=None, inversion_method="lm", max
         ws.y = np.copy(obs)
         ws.vmr_field.value = np.copy(vmr_a_priori)
         ws.t_field.value = np.copy(t_a_priori)
-        # Check for existence of transmittance variable,
-        # which is only created when t_surface is retrieved.
-        if t_surface is not None:
-            ws.t_surface.value[0, 0] = np.copy(t_surface[enum])
-            #ws.t_field.value[0, 0, 0] = np.copy(t_surface[enum])
         ws.xaStandard()  # a_priori vector is current state of retrieval fields in ws, but transformed
         ws.x = np.array([])  # create empty vector for retrieved state vector?
         ws.yf = np.array([])  # create empty vector for simulated TB?
@@ -397,10 +398,12 @@ def oem_retrieval(ws, ybatch_indices, t_surface=None, inversion_method="lm", max
         #print(ws.t_field.value[0,0,0])
         retrieved_h2o_vmr.append(np.copy(ws.vmr_field.value[0, :, 0, 0]))
         retrieved_t.append(np.copy(ws.t_field.value[:, 0, 0]))
+        retrieved_ts.append(ws.surface_props_data.value[0])
         retrieved_y.append(np.copy(ws.y.value))
         retrieved_jacobian.append(np.copy(ws.jacobian.value))
     ws.WriteXML("ascii", retrieved_h2o_vmr, "retrieval_output/retrieved_h2o_vmr.xml")
     ws.WriteXML("ascii", retrieved_t, "retrieval_output/retrieved_temperature.xml")
+    ws.WriteXML("ascii", retrieved_ts, "retrieval_output/retrieved_surface_temperature.xml")
     ws.WriteXML("ascii", retrieved_y, "retrieval_output/retrieved_y.xml")
     ws.WriteXML("ascii", retrieved_jacobian, "retrieval_output/retrieved_jacobian.xml")
 
@@ -424,8 +427,11 @@ def get_transmittance(ws):
     ws.MatrixCreate("planck_a")
     ws.MatrixPlanck(ws.planck_a, ws.stokes_dim, ws.f_backend.value, ws.t_surface_a.value[0, 0])
     ws.VectorCreate("transmittance")
-    ws.transmittance = planck(ws.f_backend.value, ws.y.value) / ws.planck_a.value[:, 0] / \
-                       (1 - ws.surface_scalar_reflectivity.value)
+    if ws.iy_unit.value == "PlanckBT":
+        ws.transmittance = planck(ws.f_backend.value, ws.y.value) / ws.planck_a.value[:, 0] / \
+                           (1 - ws.surface_scalar_reflectivity.value)
+    else:
+        ws.transmittance = ws.y.value / ws.planck_a.value[:, 0] / (1 - ws.surface_scalar_reflectivity.value)
     return ws
 
 
@@ -442,15 +448,15 @@ def oem_t_surface(ws, ybatch_indices, max_iter):
         iter_n = 0
         while not_converged:
             iter_n += 1
-            ws.jacobian_Ts = np.array([(ws.transmittance.value * (1 - ws.surface_scalar_reflectivity.value))]).T
-                             #np.array([planck_derivative_T(ws.f_backend.value, ws.t_surface.value[0, 0]) *
-                             #          ws.transmittance.value * (1 - ws.surface_scalar_reflectivity.value)]).T
+            ws.jacobian_Ts = np.array([planck_derivative_T(ws.f_backend.value, ws.t_surface.value[0, 0]) *
+                                      ws.transmittance.value * (1 - ws.surface_scalar_reflectivity.value)]).T
             ws.t_surface = gauss_newton_t_surface(ws, Sa, Sy)
             print(f"iter{iter_n}, t_surface={ws.t_surface.value}")
             print(f"iter{iter_n}, cost={eval_cost_function(ws, Sa, Sy)}")
             if iter_n == max_iter:
                 break
         retrieved_Ts.append(np.array([np.copy(ws.t_surface.value[0, 0])]))
+    ws.WriteXML("ascii", ws.jacobian_Ts, "retrieval_output/jacobian_t_surface.xml")
     ws.WriteXML("ascii", retrieved_Ts, "retrieval_output/retrieved_t_surface.xml")
 
 
