@@ -213,11 +213,13 @@ def iasi_observation(ws, f_ranges, atm_batch_path, ybatch_start=None, ybatch_n=N
                     np.array([np.random.normal(loc=0.0, scale=0.2)
                               for i in range(np.sum(ws.f_backend.value >= wavenumber2frequency(175000)))])
         ws.WriteXML("ascii", ws.ybatch_jacobians,
-                    f"observations/{batch_atm_fields_name}_{f_str}_cm-1_jacobian.xml")
+                    f"observations/{batch_atm_fields_name}_{f_str}_cm-1_jacobian"
+                    f"{ws.ybatch_start.value}-{ws.ybatch_start.value + ws.ybatch_n.value}.xml")
         ws.WriteXML("ascii", ws.batch_atm_fields_compact,
                     f"observations/{batch_atm_fields_name}_atm_fields.xml")
     ws.WriteXML("ascii", ws.ybatch,
-                f"observations/{batch_atm_fields_name}_{f_str}_cm-1.xml")
+                f"observations/{batch_atm_fields_name}_{f_str}_cm-1"
+                f"{ws.ybatch_start.value}-{ws.ybatch_start.value + ws.ybatch_n.value}.xml")
     return ws
 
 
@@ -376,6 +378,7 @@ def oem_retrieval(ws, ybatch_indices, inversion_method="lm", max_iter=20, gamma_
     retrieved_jacobian = []
     vmr_a_priori = np.copy(ws.vmr_field.value)
     t_a_priori = np.copy(ws.t_field.value)
+    oem_diagnostics = []
     for enum, obs in enumerate(np.array(ws.ybatch.value)[ybatch_indices]):
         ws.y = np.copy(obs)
         ws.vmr_field.value = np.copy(vmr_a_priori)
@@ -402,10 +405,18 @@ def oem_retrieval(ws, ybatch_indices, inversion_method="lm", max_iter=20, gamma_
                                             gamma_lower_limit, gamma_upper_convergence_limit]))
         except Exception:
             print(ws.oem_errors.value)
+            retrieved_h2o_vmr.append(np.nan * np.ones(ws.vmr_field.value[0, :, 0, 0].shape))
+            retrieved_t.append(np.nan * np.ones(ws.t_field.value[:, 0, 0].shape))
+            retrieved_ts.append(np.nan * np.ones(ws.surface_props_data.value[0].shape))
+            retrieved_y.append(np.nan * np.ones(ws.y.value.shape))
+            retrieved_jacobian.append(np.nan * np.ones((len(ws.y.value), len(ws.p_grid.value) * 2 + 1)))
+            oem_diagnostics.append(np.nan * np.ones(5))
             continue
         ws.x2artsAtmAndSurf()  # convert from ARTS coords back to user-defined grid
         #print(ws.t_surface.value)
         #print(ws.t_field.value[0,0,0])
+        oem_diagnostics.append(ws.oem_diagnostics.value)
+        # oem_diagnostics[-1][0] = int(oem_diagnostics[-1][0])
         retrieved_h2o_vmr.append(np.copy(ws.vmr_field.value[0, :, 0, 0]))
         retrieved_t.append(np.copy(ws.t_field.value[:, 0, 0]))
         retrieved_ts.append(ws.surface_props_data.value[0])
@@ -421,6 +432,8 @@ def oem_retrieval(ws, ybatch_indices, inversion_method="lm", max_iter=20, gamma_
                                       f"{ws.ybatch_start.value}-{ws.ybatch_start.value + ws.ybatch_n.value}.xml")
     ws.WriteXML("ascii", retrieved_jacobian, f"retrieval_output/retrieved_jacobian_batch_profiles_"
                                              f"{ws.ybatch_start.value}-{ws.ybatch_start.value + ws.ybatch_n.value}.xml")
+    ws.WriteXML("ascii", oem_diagnostics, f"retrieval_output/oem_diagnostics_batch_profiles_"
+                                            f"{ws.ybatch_start.value}-{ws.ybatch_start.value + ws.ybatch_n.value}.xml")
     return ws
 
 #def save_current_atm_state_as_batch(ws, path):
