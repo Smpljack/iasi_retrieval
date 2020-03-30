@@ -1,9 +1,11 @@
 import os
-
 import numpy as np
 from scipy.linalg import inv
+import pandas as pd
+
 from typhon.arts.workspace import arts_agenda
-from typhon.physics import wavenumber2frequency, frequency2wavenumber, constants, planck, radiance2planckTb
+from typhon.physics import wavenumber2frequency, frequency2wavenumber, \
+    constants, planck, radiance2planckTb, moist_lapse_rate, relative_humidity2vmr
 
 
 def setup_retrieval_paths(project_path, project_name):
@@ -18,7 +20,9 @@ def setup_retrieval_paths(project_path, project_name):
     os.chdir(project_path + project_name)
 
 
-def load_abs_lookup(ws, atm_batch_path=None, abs_lookup_path=None, f_ranges=None, line_shape='Voigt_Kuntz6'):
+def load_abs_lookup(ws, hitran_split_artscat5_path, atm_batch_path=None,
+                    abs_lookup_base_path=None, abs_lookup_path=None, f_ranges=None,
+                    line_shape='Voigt_Kuntz6'):
     """
     Loads existing absorption lookup table or creates one in case it does
     not exist yet for given batch of atmospheres and frequency range.
@@ -31,7 +35,7 @@ def load_abs_lookup(ws, atm_batch_path=None, abs_lookup_path=None, f_ranges=None
     f_str = "_".join([f"{int(frequency2wavenumber(freq[0] / 100))}_"
                       f"{int(frequency2wavenumber(freq[1]) / 100)}" for freq in f_ranges])
     if not abs_lookup_path:
-        abs_lookup_path = "/scratch/uni/u237/users/mprange/phd/iasi_retrieval/abs_lookup_tables/" \
+        abs_lookup_path = f"{abs_lookup_base_path}" \
                           f"abs_lookup_{os.path.basename(atm_batch_path).split(os.extsep, 1)[0]}_{f_str}_cm-1.xml"
     if os.path.isfile(abs_lookup_path):
         ws.ReadXML(ws.abs_lookup, abs_lookup_path)
@@ -41,11 +45,8 @@ def load_abs_lookup(ws, atm_batch_path=None, abs_lookup_path=None, f_ranges=None
         ws.ReadXML(ws.batch_atm_fields_compact,
                    atm_batch_path)
         ws = abs_setup(ws)
-        # ws.abs_lineshapeDefine(shape=line_shape,
-        #                        forefactor='VVH',
-        #                        cutoff=750e9)
         ws.ReadSplitARTSCAT(
-            basename='/scratch/uni/u237/data/catalogue/hitran/hitran_split_artscat5/',
+            basename=hitran_split_artscat5_path,
             fmin=(np.min(ws.f_grid.value) - ws.f_backend_width * 10)[0],
             fmax=(np.max(ws.f_grid.value) + ws.f_backend_width * 10)[0],
             globalquantumnumbers="",
@@ -248,34 +249,24 @@ def abs_setup(ws):
     return ws
 
 
-def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, retrieval_quantities,
-                        cov_cross=None, cov_h2o_vmr=None, cov_t=None, cov_t_surface=None, t_surface=None,
-                        t_profile=None, h2o_vmr_profile=None, z_grid=None, p_grid=None):
-    """
-
-    :param ws:
-    :param t_a_priori:
-    :param vmr_a_priori:
-    :param cov_h2o_vmr:
-    :param cov_t:
-    :param retrieval_quantities:
-    :return:
-    """
+def setup_apriori_state(ws, a_priori_atm_batch_path, batch_ind,
+                        moist_adiabat=False, t_surface_std=None, stratospheric_temperature=None, RH=None):
     ws.ReadXML(ws.batch_atm_fields_compact, a_priori_atm_batch_path)
     ws = abs_setup(ws)
     ws.Extract(ws.atm_fields_compact,
                ws.batch_atm_fields_compact,
-               a_priori_atm_index)
+               int(batch_ind))
     ws.AtmFieldsAndParticleBulkPropFieldFromCompact()
     ws.lat_grid = []
     ws.lon_grid = []
     # ws.AtmFieldsCalc()
-    ws.AbsInputFromAtmFields()
-    if t_surface is not None:
-        ws.t_surface = t_surface
-    else:
-        ws.Extract(ws.t_surface, ws.t_field, 0)
+    ws.Extract(ws.t_surface, ws.t_field, 0)
     ws.Extract(ws.z_surface, ws.z_field, 0)
+    if moist_adiabat:
+        ws = t_profile_to_moist_adiabat(ws, t_surface_std, stratospheric_temperature)
+    if RH is not None:
+        ws = h2o_vmr_from_RH(ws, RH)
+    ws.AbsInputFromAtmFields()
     ws.atmfields_checkedCalc(bad_partition_functions_ok=1)
     ws.atmgeom_checkedCalc()
     ws.cloudbox_checkedCalc()
@@ -285,7 +276,11 @@ def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, retriev
     sdata = np.array([ws.t_surface.value])
     ws.Copy(ws.surface_props_names, snames)
     ws.Copy(ws.surface_props_data, sdata)
+    return ws
 
+
+def setup_retrieval_quantities(ws, retrieval_quantities, cov_cross=None, cov_h2o_vmr=None,
+                               cov_t=None, cov_t_surface=None):
     if "t_surface_python" in retrieval_quantities:
         ws = get_transmittance(ws)
         ws.MatrixCreate("cov_t_surface")
@@ -299,7 +294,7 @@ def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, retriev
         ws.retrievalDefInit()
         if "t_surface" in retrieval_quantities:
             ws.retrievalAddSurfaceQuantity(
-                g1=ws.lat_grid, g2=ws.lon_grid, quantity=snames[0])
+                g1=ws.lat_grid, g2=ws.lon_grid, quantity="Skin temperature")
             ws.covmat_sxAddBlock(block=cov_t_surface)
 
         if "Temperature" in retrieval_quantities:
@@ -319,7 +314,8 @@ def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, retriev
             ws.covmat_sxAddBlock(block=cov_h2o_vmr)
 
         if cov_cross is not None:
-            ws.covmat_sxAddBlock(block=cov_cross, i=0, j=1)
+            for S_dict in cov_cross:
+                ws.covmat_sxAddBlock(block=S_dict["S"], i=S_dict["i"], j=S_dict["j"])
         cov_y = np.diag(np.ones(ws.f_backend.value.size))
         low_noise_ind = ws.f_backend.value < wavenumber2frequency(175000)
         high_noise_ind = ws.f_backend.value >= wavenumber2frequency(175000)
@@ -327,31 +323,109 @@ def setup_oem_retrieval(ws, a_priori_atm_batch_path, a_priori_atm_index, retriev
         cov_y[high_noise_ind, high_noise_ind] *= 0.2**2
         ws.covmat_seAddBlock(block=cov_y)
         ws.retrievalDefClose()
-        ws.WriteXML("ascii", cov_y, "sensor/covariance_y.xml")
+        ws.WriteXML("ascii", cov_y, "sensor/covmat_sy.xml")
         ws.WriteXML("ascii", ws.covmat_sx, "a_priori/covmat_sx.xml")
-    ws.WriteXML("ascii", ws.vmr_field, "a_priori/a_priori_vmr.xml")
-    ws.WriteXML("ascii", ws.t_field, "a_priori/a_priori_temperature.xml")
-    ws.WriteXML("ascii", ws.p_grid, "a_priori/a_priori_p.xml")
-    ws.WriteXML("ascii", ws.z_field.value[:, 0, 0], "a_priori/a_priori_z.xml")
     return ws
 
 
-def oem_retrieval(ws, ybatch_indices, inversion_method="lm", max_iter=20, gamma_start=1000,
+def save_atm_state(ws, dirname):
+    ws.WriteXML("ascii", ws.vmr_field, f"{dirname}/vmr.xml")
+    ws.WriteXML("ascii", ws.t_field, f"{dirname}/temperature.xml")
+    ws.WriteXML("ascii", ws.t_surface, f"{dirname}/t_surface.xml")
+    ws.WriteXML("ascii", ws.p_grid, f"{dirname}/p.xml")
+
+def save_z_p_grids(ws, dirname):
+    ws.WriteXML("ascii", ws.p_grid, f"{dirname}/p.xml")
+    ws.WriteXML("ascii", ws.z_field.value[:, 0, 0], f"{dirname}/z.xml")
+
+
+def t_profile_to_moist_adiabat(ws, t_surface_std, stratospheric_temperature):
+    T_moist = np.copy(ws.t_surface.value[0, :] + np.random.normal(0., t_surface_std))
+    for p, z_diff in zip(ws.p_grid.value[1:], np.diff(ws.z_field.value[:, 0, 0])):
+        if p < 15000.:
+            break
+        T_moist = np.append(T_moist,
+                            T_moist[-1] -
+                            moist_lapse_rate(p, T_moist[-1]) * z_diff)
+    full_new_T = np.append(T_moist, stratospheric_temperature + (T_moist[-1] - stratospheric_temperature[0]))
+    ws.t_field.value[:, 0, 0] = np.copy(full_new_T)
+    return ws
+
+
+def h2o_vmr_from_RH(ws, RH):
+    new_vmr = relative_humidity2vmr(RH, ws.p_grid.value, ws.t_field.value[:, 0, 0])
+    new_vmr[ws.p_grid.value < 10000.] = new_vmr[np.argmin(np.abs(ws.p_grid.value - 10000.))]
+    ws.vmr_field.value[0, :, 0, 0] = np.copy(new_vmr)
+    return ws
+
+
+def retrieve_ybatch_for_a_priori_batch(ws, retrieval_batch_indices, a_priori_batch_indices, a_priori_atm_batch_path,
+                                       t_surface_std=None,
+                                       stratospheric_temperature=None, moist_adiabat=False, RH=False,
+                                       inversion_method="lm", max_iter=15, gamma_start=10, gamma_dec_factor=2.0,
+                                       gamma_inc_factor=2.0, gamma_upper_limit=1e20, gamma_lower_limit=1.0,
+                                       gamma_upper_convergence_limit=99.0):
+    retrieved_h2o_vmr = []
+    retrieved_t = []
+    retrieved_ts = []
+    retrieved_y = []
+    retrieved_jacobian = []
+    apriori_h2o_vmr = []
+    apriori_t = []
+    apriori_ts = []
+    oem_diagnostics = []
+    for retr_batch_ind, apriori_batch_ind in zip(retrieval_batch_indices, a_priori_batch_indices):
+        ws.y = ws.ybatch.value[retr_batch_ind - ws.ybatch_start.value]
+        ws = setup_apriori_state(ws, a_priori_atm_batch_path, retr_batch_ind, moist_adiabat,
+                                 t_surface_std, stratospheric_temperature, RH)
+        apriori_h2o_vmr.append(np.copy(ws.vmr_field.value[0, :, 0, 0]))
+        apriori_t.append(np.copy(ws.t_field.value[:, 0, 0]))
+        apriori_ts.append(np.copy(ws.surface_props_data.value[0]))
+        print(f"Retrieving batch profile {retr_batch_ind + 1}.")
+        print(f"Profile {retr_batch_ind - retrieval_batch_indices[0] + 1} "
+              f"out of {len(retrieval_batch_indices)} in this job.")
+        try:
+            ws = oem_retrieval(ws, inversion_method, max_iter, gamma_start,
+                               gamma_dec_factor, gamma_inc_factor, gamma_upper_limit,
+                               gamma_lower_limit, gamma_upper_convergence_limit)
+        except Exception:
+            print(ws.oem_errors.value)
+            retrieved_h2o_vmr.append(np.nan * np.ones(ws.vmr_field.value[0, :, 0, 0].shape))
+            retrieved_t.append(np.nan * np.ones(ws.t_field.value[:, 0, 0].shape))
+            retrieved_ts.append(np.nan * np.ones(ws.surface_props_data.value[0].shape))
+            retrieved_y.append(np.nan * np.ones(ws.y.value.shape))
+            retrieved_jacobian.append(np.nan * np.ones((len(ws.y.value), len(ws.p_grid.value) * 2 + 1)))
+            oem_diagnostics.append(np.nan * np.ones(5))
+            continue
+        retrieved_h2o_vmr.append(np.copy(ws.vmr_field.value[0, :, 0, 0]))
+        retrieved_t.append(np.copy(ws.t_field.value[:, 0, 0]))
+        retrieved_ts.append(ws.surface_props_data.value[0])
+        retrieved_y.append(np.copy(ws.y.value))
+        retrieved_jacobian.append(np.copy(ws.jacobian.value))
+        oem_diagnostics.append(ws.oem_diagnostics.value)
+    ws.WriteXML("ascii", retrieved_h2o_vmr, f"retrieval_output/h2o_vmr_batch_profiles_"
+                                            f"{retrieval_batch_indices[0]}-{retrieval_batch_indices[-1]+1}.xml")
+    ws.WriteXML("ascii", retrieved_t, f"retrieval_output/temperature_batch_profiles_"
+                                      f"{retrieval_batch_indices[0]}-{retrieval_batch_indices[-1]+1}.xml")
+    ws.WriteXML("ascii", retrieved_ts, f"retrieval_output/surface_temperature_batch_profiles_"
+                                       f"{retrieval_batch_indices[0]}-{retrieval_batch_indices[-1]+1}.xml")
+    ws.WriteXML("ascii", retrieved_y, f"retrieval_output/ybatch_profiles_"
+                                      f"{retrieval_batch_indices[0]}-{retrieval_batch_indices[-1]+1}.xml")
+    ws.WriteXML("ascii", retrieved_jacobian, f"retrieval_output/jacobian_batch_profiles_"
+                                             f"{retrieval_batch_indices[0]}-{retrieval_batch_indices[-1]+1}.xml")
+    ws.WriteXML("ascii", oem_diagnostics, f"retrieval_output/oem_diagnostics_batch_profiles_"
+                                          f"{retrieval_batch_indices[0]}-{retrieval_batch_indices[-1]+1}.xml")
+    ws.WriteXML("ascii", apriori_h2o_vmr, f"a_priori/h2o_vmr_batch_profiles_"
+                                          f"{retrieval_batch_indices[0]}-{retrieval_batch_indices[-1]+1}.xml")
+    ws.WriteXML("ascii", apriori_t, f"a_priori/temperature_batch_profiles_"
+                                    f"{retrieval_batch_indices[0]}-{retrieval_batch_indices[-1]+1}.xml")
+    ws.WriteXML("ascii", apriori_ts, f"a_priori/surface_temperature_batch_profiles_"
+                                     f"{retrieval_batch_indices[0]}-{retrieval_batch_indices[-1]+1}.xml")
+
+
+def oem_retrieval(ws, inversion_method="lm", max_iter=20, gamma_start=1000,
                   gamma_dec_factor=2.0, gamma_inc_factor=2.0, gamma_upper_limit=1e20,
                   gamma_lower_limit=1.0, gamma_upper_convergence_limit=99.0):
-    """
-    :param ws:
-    :param ybatch_indices:
-    :param inversion_method:
-    :param max_iter:
-    :param gamma_start:
-    :param gamma_dec_factor:
-    :param gamma_inc_factor:
-    :param gamma_upper_limit:
-    :param gamma_lower_limit:
-    :param gamma_upper_convergence_limit:
-    :return:
-    """
     # define inversion iteration as function object within python
     @arts_agenda
     def inversion_agenda(ws):
@@ -371,73 +445,22 @@ def oem_retrieval(ws, ybatch_indices, inversion_method="lm", max_iter=20, gamma_
         ws.jacobianAdjustAndTransform()
     ws.Copy(ws.inversion_iterate_agenda, inversion_agenda)
 
-    retrieved_h2o_vmr = []
-    retrieved_t = []
-    retrieved_ts = []
-    retrieved_y = []
-    retrieved_jacobian = []
-    vmr_a_priori = np.copy(ws.vmr_field.value)
-    t_a_priori = np.copy(ws.t_field.value)
-    oem_diagnostics = []
-    for enum, obs in enumerate(np.array(ws.ybatch.value)[ybatch_indices]):
-        ws.y = np.copy(obs)
-        ws.vmr_field.value = np.copy(vmr_a_priori)
-        ws.t_field.value = np.copy(t_a_priori)
-        ws.xaStandard()  # a_priori vector is current state of retrieval fields in ws, but transformed
-        ws.x = np.array([])  # create empty vector for retrieved state vector?
-        ws.yf = np.array([])  # create empty vector for simulated TB?
-        ws.jacobian = np.array([[]])
-        ws.oem_errors = []
-        try:
-            print(f"Retrieving batch profile {ws.ybatch_start.value + enum}.")
-        except Exception:
-            pass
-        print(f"Profile {enum+1} out of {len(ybatch_indices)} in this job.")
-        try:
-            ws.OEM(method=inversion_method,
-                   max_iter=max_iter,
-                   display_progress=1,
-                   max_start_cost=1e5,
-                   # start value for gamma, decrease/increase factors,
-                   # upper limit for gamma, lower gamma limit which causes gamma=0
-                   # Upper gamma limit, above which no convergence is accepted
-                   lm_ga_settings=np.array([gamma_start, gamma_dec_factor, gamma_inc_factor, gamma_upper_limit,
-                                            gamma_lower_limit, gamma_upper_convergence_limit]))
-        except Exception:
-            print(ws.oem_errors.value)
-            retrieved_h2o_vmr.append(np.nan * np.ones(ws.vmr_field.value[0, :, 0, 0].shape))
-            retrieved_t.append(np.nan * np.ones(ws.t_field.value[:, 0, 0].shape))
-            retrieved_ts.append(np.nan * np.ones(ws.surface_props_data.value[0].shape))
-            retrieved_y.append(np.nan * np.ones(ws.y.value.shape))
-            retrieved_jacobian.append(np.nan * np.ones((len(ws.y.value), len(ws.p_grid.value) * 2 + 1)))
-            oem_diagnostics.append(np.nan * np.ones(5))
-            continue
-        ws.x2artsAtmAndSurf()  # convert from ARTS coords back to user-defined grid
-        #print(ws.t_surface.value)
-        #print(ws.t_field.value[0,0,0])
-        oem_diagnostics.append(ws.oem_diagnostics.value)
-        # oem_diagnostics[-1][0] = int(oem_diagnostics[-1][0])
-        retrieved_h2o_vmr.append(np.copy(ws.vmr_field.value[0, :, 0, 0]))
-        retrieved_t.append(np.copy(ws.t_field.value[:, 0, 0]))
-        retrieved_ts.append(ws.surface_props_data.value[0])
-        retrieved_y.append(np.copy(ws.y.value))
-        retrieved_jacobian.append(np.copy(ws.jacobian.value))
-    ws.WriteXML("ascii", retrieved_h2o_vmr, f"retrieval_output/retrieved_h2o_vmr_batch_profiles_"
-                                            f"{ws.ybatch_start.value}-{ws.ybatch_start.value + ws.ybatch_n.value}.xml")
-    ws.WriteXML("ascii", retrieved_t, f"retrieval_output/retrieved_temperature_batch_profiles_"
-                                      f"{ws.ybatch_start.value}-{ws.ybatch_start.value + ws.ybatch_n.value}.xml")
-    ws.WriteXML("ascii", retrieved_ts, f"retrieval_output/retrieved_surface_temperature_batch_profiles_"
-                                       f"{ws.ybatch_start.value}-{ws.ybatch_start.value + ws.ybatch_n.value}.xml")
-    ws.WriteXML("ascii", retrieved_y, f"retrieval_output/retrieved_y_batch_profiles_"
-                                      f"{ws.ybatch_start.value}-{ws.ybatch_start.value + ws.ybatch_n.value}.xml")
-    ws.WriteXML("ascii", retrieved_jacobian, f"retrieval_output/retrieved_jacobian_batch_profiles_"
-                                             f"{ws.ybatch_start.value}-{ws.ybatch_start.value + ws.ybatch_n.value}.xml")
-    ws.WriteXML("ascii", oem_diagnostics, f"retrieval_output/oem_diagnostics_batch_profiles_"
-                                            f"{ws.ybatch_start.value}-{ws.ybatch_start.value + ws.ybatch_n.value}.xml")
+    ws.xaStandard()  # a_priori vector is current state of retrieval fields in ws, but transformed
+    ws.x = np.array([])  # create empty vector for retrieved state vector?
+    ws.yf = np.array([])  # create empty vector for simulated TB?
+    ws.jacobian = np.array([[]])
+    ws.oem_errors = []
+    ws.OEM(method=inversion_method,
+           max_iter=max_iter,
+           display_progress=1,
+           max_start_cost=1e5,
+           # start value for gamma, decrease/increase factors,
+           # upper limit for gamma, lower gamma limit which causes gamma=0
+           # Upper gamma limit, above which no convergence is accepted
+           lm_ga_settings=np.array([gamma_start, gamma_dec_factor, gamma_inc_factor, gamma_upper_limit,
+                                    gamma_lower_limit, gamma_upper_convergence_limit]))
+    ws.x2artsAtmAndSurf()  # convert from ARTS coords back to user-defined grid
     return ws
-
-#def save_current_atm_state_as_batch(ws, path):
-
 
 def radiance2planck_bt_wavenumber(r, wavenumber):
     c = constants.speed_of_light
@@ -529,17 +552,21 @@ def corr_length_cov(z, trpp=12.5e3):
     return cl
 
 
-def covmat_cross(covmat_h2o, covmat_t, z_grid, corr_height=1500.):
+def covmat_cross(covmat1, covmat2, z_grid, corr_height=1500.):
     """
     Return cross-covariance block for given H2O and Temperature
     covariance matrices. The cross-covariances drop exponentially
     with height (1/e at corr_height) and correlation length approach
     is used for determining non-diagonal entries.
     """
-    S = np.zeros(covmat_t.shape)
-    S[np.diag_indices_from(S)] = [np.sqrt(covmat_h2o[0, 0] * covmat_t[0, 0]) * np.exp(-1 / corr_height * z_grid[i])
-                                  for i in range(len(z_grid))]
+    S = np.zeros((covmat1.shape[0], covmat2.shape[0]))
+    if np.any(np.array(S.shape) == 1):
+        S = np.array([np.sqrt(covmat1[0, 0] * covmat2[0, 0]) * np.exp(-1 / corr_height * z_grid[i])
+             for i in range(len(z_grid))]).reshape(1, len(z_grid))
+        return S
 
+    S[np.diag_indices_from(S)] = [np.sqrt(covmat1[0, 0] * covmat2[0, 0]) * np.exp(-1 / corr_height * z_grid[i])
+                                  for i in range(len(z_grid))]
     cl = corr_length_cov(z_grid)
     for i in range(S.shape[1]):
         for j in range(S.shape[0]):
@@ -548,6 +575,3 @@ def covmat_cross(covmat_h2o, covmat_t, z_grid, corr_height=1500.):
             S[i, j] = s * np.exp(-np.abs(z_grid[i] - z_grid[j]) / cl_mean)
 
     return S
-
-
-# def oem_retrieval
