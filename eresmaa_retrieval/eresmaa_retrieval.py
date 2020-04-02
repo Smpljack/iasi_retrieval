@@ -16,7 +16,7 @@ if len(arg_list) == 3:
 elif len(arg_list) == 2:
     ybatch_n = int(arg_list[1])
 elif len(arg_list) == 1:
-    ybatch_start = 8  # If not provided in command line, set here.
+    ybatch_start = 2  # If not provided in command line, set here.
     ybatch_n = 1  # If not provided in command line, set here.
 
 ws = Workspace(verbosity=1)
@@ -33,9 +33,8 @@ f_backend_width = wavenumber2frequency(25.)
 full_spec = np.arange(wavenumber2frequency(645.0 * 100),
                       wavenumber2frequency(2760.0 * 100),
                       f_backend_width)
-
-a_priori_fascod_path = "/Users/mprange/PycharmProjects/iasi_retrieval/" \
-                       "eresmaa_retrieval/a_priori/garand0_eresmaa_profile.xml"
+fascod_path = '/Users/mprange/PycharmProjects/iasi_retrieval/eresmaa_retrieval/'\
+              '/a_priori/garand0_eresmaa_profile.xml'
 eresmaa_path = "/Users/mprange/data/tropical_ocean_clearsky_eresmaal137_all_q.xml"
 eresmaa = xml.load(eresmaa_path)
 z = eresmaa[1][1][:, 0, 0]
@@ -100,6 +99,8 @@ ws = ioem.retrieve_ybatch_for_a_priori_batch(ws,
                                              a_priori_atm_batch_path=eresmaa_path,
                                              retrieval_batch_indices=np.arange(ybatch_start, ybatch_start + ybatch_n),
                                              a_priori_batch_indices=np.arange(ybatch_start, ybatch_start + ybatch_n),
+                                             Sa_T=Sa_T,
+                                             Sa_h2o=Sa_h2o,
                                              moist_adiabat=True,
                                              t_surface_std=1.5,
                                              stratospheric_temperature=stratospheric_temperature,
